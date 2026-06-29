@@ -44,24 +44,30 @@ def submittal_id_from_name(zip_name):
     return m.group(1).upper() if m else zip_name.replace('.zip', '')
 
 def extract_pdf_text(zip_bytes):
-    """Pull text from PDFs inside the ZIP using pdfplumber.
+    """Pull text from the COMMENT-bearing PDF inside the ZIP using pdfplumber.
 
-    Returns (pages_text, unreadable_pages):
-      pages_text       - list of per-page text (document order)
-      unreadable_pages - count of image-heavy / low-text pages. These MAY carry
-                         scanned reviewer comments that text extraction can't
-                         read. The count over-reports (plain drawing pages also
-                         count), so it's a "worth checking" signal, not proof of
-                         missing comments.
+    Reviewer comments live only in an annotated markup PDF ('*_annotated*') or a
+    reviewer 'Response' PDF. The plain datasheet and the submittal lead sheet
+    contain NO reviewer comments — reading them makes the LLM invent "comments"
+    out of spec-sheet text (false positives). So:
+      - If a comment file (annotated/response) exists, read only that.
+      - If NONE exists, the submittal has no reviewer comments: return empty.
+
+    Returns (pages_text, unreadable_pages, had_comment_file).
     """
     pages_text = []
     unreadable_pages = 0
+    had_comment_file = False
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
             all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
-            annotated = [f for f in all_pdfs if 'annotated' in f.lower()]
-            pdfs = annotated if annotated else all_pdfs
-            for name in pdfs:
+            comment_pdfs = [f for f in all_pdfs
+                            if 'annotated' in f.lower() or 'response' in f.lower()]
+            if not comment_pdfs:
+                # No markup/response file -> no reviewer comments at all.
+                return [], 0, False
+            had_comment_file = True
+            for name in comment_pdfs:
                 try:
                     raw = zf.read(name)
                     with pdfplumber.open(io.BytesIO(raw)) as pdf:
@@ -69,6 +75,7 @@ def extract_pdf_text(zip_bytes):
                             t = page.extract_text() or ""
                             if t.strip():
                                 pages_text.append(t)
+                            # low/no text but has images = possible scanned page
                             if len(t.strip()) < 50:
                                 try:
                                     if len(page.images) > 0:
@@ -79,7 +86,32 @@ def extract_pdf_text(zip_bytes):
                     pass
     except Exception:
         pass
-    return pages_text, unreadable_pages
+    return pages_text, unreadable_pages, had_comment_file
+
+def extract_doc_name_from_zip(zip_bytes):
+    """Get the document name from ANY pdf in the zip (lead sheet / datasheet),
+    so the Document column is filled even when there are no comments."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+            all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
+            # prefer a datasheet/lead sheet (has the cover info)
+            for name in all_pdfs:
+                try:
+                    raw = zf.read(name)
+                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                        pages = []
+                        for p in pdf.pages[:3]:
+                            t = p.extract_text() or ""
+                            if t.strip():
+                                pages.append(t)
+                        dn = extract_doc_name(pages)
+                        if dn:
+                            return dn
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return ""
 
 def extract_doc_name(pages_text):
     """Build '{DOC_NO}_{Title}' from the cover-page text (Document column)."""
@@ -99,8 +131,7 @@ def extract_doc_name(pages_text):
     return doc_no or title or ""
 
 # Words/phrases that signal a page carries reviewer comments rather than
-# pure spec-sheet boilerplate. Used only to decide what to keep if a document
-# is too long for the budget.
+# pure spec-sheet boilerplate. Used to prioritise pages for the LLM.
 COMMENT_SIGNALS = re.compile(
     r'\b(shall|should|to be|required|ensure|provide|verify|comply|complian'
     r'|approved|vendor|deviation|clarification|as per|not acceptable'
@@ -109,7 +140,7 @@ COMMENT_SIGNALS = re.compile(
 )
 
 def prioritise_pages(pages_text, char_budget=24000):
-    """Keep pages in DOCUMENT ORDER (so comments stay top-to-bottom).
+    """Keep pages in DOCUMENT ORDER (so comments stay 1,2,3 top-to-bottom).
     Only when the total exceeds the budget do we drop the lowest-signal pages,
     but the pages we keep are always re-emitted in their original order."""
     total = sum(len(t) for t in pages_text)
@@ -130,7 +161,7 @@ def prioritise_pages(pages_text, char_budget=24000):
     return "\n".join(kept)
 
 # ============================================================================
-# COMMENT SPLITTER
+# COMMENT SPLITTER (backstop for when the model still merges a numbered list)
 # Splits only on clear "N) " list markers. Will NOT break "1.5 sq mm",
 # "26 29 23", "433V", "80-100 microns", etc.
 # ============================================================================
@@ -145,6 +176,7 @@ def split_merged_comments(comments_list):
             result.append(comment.strip())
     return result
 
+# Lines that are headers/instructions, not actual review comments.
 HEADER_PATTERNS = re.compile(
     r'^(clarification|clarifications required|following points|following items'
     r'|please incorporate|please note the following|comments?:?$)',
@@ -159,6 +191,8 @@ def drop_headers(comments_list):
         out.append(c)
     return out
 
+# Remove an inline lead-in that precedes the first real item, e.g.
+# "Clarifications required for following points wrt the Jacobs specifications: Approved vendors..."
 LEADIN = re.compile(
     r'^(clarifications?\s+required[^:]*:\s*'
     r'|following\s+(?:points|items)[^:]*:\s*'
@@ -176,7 +210,7 @@ PROMPT_TEMPLATE = """You are extracting reviewer comments from an engineering su
 
 Below is the text of a submittal PDF. Reviewers have added comments/markups requesting clarifications or changes.
 
-Extract EVERY distinct reviewer comment as its own separate item, in the order they appear in the text.
+Extract EVERY distinct reviewer comment as its own separate item.
 
 STRICT RULES:
 - Each comment = ONE distinct instruction, requirement, or question.
@@ -256,13 +290,21 @@ async def _process_one(session, zip_name, zip_bytes, sem):
     runs gc before returning so memory doesn't accumulate across 28 files."""
     async with sem:
         try:
-            pages, unreadable = extract_pdf_text(zip_bytes)
-            text = prioritise_pages(pages)
-            doc_name = extract_doc_name(pages)
-            pages = None
-            zip_bytes = None
-            gc.collect()
-            res = await _llm_only(session, zip_name, text, doc_name, unreadable)
+            pages, unreadable, had_comment_file = extract_pdf_text(zip_bytes)
+            doc_name = extract_doc_name_from_zip(zip_bytes)
+            if not had_comment_file:
+                # No annotated/response PDF -> genuinely no reviewer comments.
+                # Don't call the LLM (avoids inventing comments from datasheets).
+                zip_bytes = None
+                res = {"submittal": submittal_id_from_name(zip_name),
+                       "document": doc_name, "unreadable": 0,
+                       "comments": [], "error": None}
+            else:
+                zip_bytes = None
+                text = prioritise_pages(pages)
+                pages = None
+                gc.collect()
+                res = await _llm_only(session, zip_name, text, doc_name, unreadable)
         except Exception as e:
             res = {"submittal": submittal_id_from_name(zip_name),
                    "document": "", "unreadable": 0,
@@ -404,7 +446,7 @@ if uploaded:
             bar.progress(done / total)
             status.text(f"Processed {done}/{total} submittals...")
 
-        status.text("Sending to Groq...")
+        status.text("Sending to Groq in parallel...")
         results = asyncio.run(process_all(zip_files, cb))
         status.text("Building Excel...")
 
