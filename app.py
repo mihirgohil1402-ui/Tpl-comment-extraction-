@@ -1,14 +1,14 @@
 # app.py - TPL Comment Extractor (Groq + parallel + comment splitting)
 #
 # Setup:
-#   pip install streamlit aiohttp openpyxl PyPDF2
+#   pip install streamlit aiohttp openpyxl pdfplumber
 #   Put your key in .streamlit/secrets.toml:  groq_api_key = "gsk_..."
 #   streamlit run app.py
 
 import streamlit as st
 import zipfile
 import io
-from PyPDF2 import PdfReader
+import pdfplumber
 import asyncio
 import aiohttp
 import json
@@ -41,18 +41,26 @@ def submittal_id_from_name(zip_name):
     return m.group(1).upper() if m else zip_name.replace('.zip', '')
 
 def extract_pdf_text(zip_bytes):
-    """Pull text from every PDF inside the ZIP."""
+    """Pull text from PDFs inside the ZIP using pdfplumber.
+
+    Reviewer comments live in the *_annotated.pdf as positioned callout text on
+    drawing pages. PyPDF2 misses/garbles that; pdfplumber reads it correctly.
+    We prefer the annotated PDF when present (that's where the comments are),
+    otherwise fall back to all PDFs.
+    """
     text_parts = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-            pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
+            all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
+            annotated = [f for f in all_pdfs if 'annotated' in f.lower()]
+            pdfs = annotated if annotated else all_pdfs
             for name in pdfs:
                 try:
-                    with zf.open(name) as fh:
-                        reader = PdfReader(io.BytesIO(fh.read()))
-                        for page in reader.pages:
-                            t = page.extract_text()
-                            if t:
+                    raw = zf.read(name)
+                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                        for page in pdf.pages:
+                            t = page.extract_text() or ""
+                            if t.strip():
                                 text_parts.append(t)
                 except Exception:
                     pass
@@ -158,10 +166,15 @@ async def extract_one(session, zip_name, pdf_text, sem):
     try:
         start = content.find("{")
         end = content.rfind("}")
+        if start == -1 or end == -1:
+            print(f"DEBUG {sub_id}: No JSON found. Response: {content[:200]}")
+            return {"submittal": sub_id, "comments": [], "error": "No JSON in response"}
         parsed = json.loads(content[start:end+1])
         raw = parsed.get("comments", [])
-    except Exception:
-        return {"submittal": sub_id, "comments": [], "error": "Parse failed"}
+        print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from Groq")
+    except Exception as e:
+        print(f"DEBUG {sub_id}: Parse error: {e}. Response: {content[:200]}")
+        return {"submittal": sub_id, "comments": [], "error": f"Parse failed: {str(e)[:40]}"}
 
     # Clean: strip any leading numbering the model added, then SPLIT merged
     # numbered blocks, THEN drop header/lead-in fragments. Order matters:
@@ -333,3 +346,4 @@ if uploaded:
                 st.markdown(f"**{r['submittal']}** — {len(r['comments'])} comment(s)")
                 for i, c in enumerate(r["comments"], 1):
                     st.write(f"{i}. {c}")
+                    
