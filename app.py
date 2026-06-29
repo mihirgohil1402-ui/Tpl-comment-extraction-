@@ -28,8 +28,6 @@ GROQ_API_KEY = st.secrets.get("groq_api_key", "")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 
-# How many ZIPs to send to Groq at once. Keeps us under rate limits while
-# still being fast. 8 concurrent is comfortable on the free tier.
 CONCURRENCY = 8
 
 # ============================================================================
@@ -44,10 +42,8 @@ def extract_pdf_text(zip_bytes):
     """Pull text from PDFs inside the ZIP using pdfplumber.
 
     Reviewer comments live in the *_annotated.pdf as positioned callout text on
-    drawing pages, which sit toward the END of the document (after spec tables
-    and boilerplate). We collect per-page text, then order pages so the ones
-    most likely to contain reviewer comments come FIRST — otherwise a length
-    cap would chop off exactly the pages we care about.
+    drawing pages, which sit toward the END of the document. We collect per-page
+    text and keep it in document order.
     """
     pages_text = []
     try:
@@ -69,8 +65,26 @@ def extract_pdf_text(zip_bytes):
         pass
     return pages_text
 
+def extract_doc_name(pages_text):
+    """Build '{DOC_NO}_{Title}' from the cover-page text (Document column)."""
+    full = "\n".join(pages_text[:3])
+    doc_no = None
+    m = re.search(r'\b(TPL-[A-Z0-9]+-\d+-[A-Z]+-[A-Z]+-\d+)\b', full, re.I)
+    if m:
+        doc_no = m.group(1)
+    title = None
+    mt = re.search(r'(?:Document Title:|Doc\.?\s*Title:)\s*(.+?)(?:DOC\s*NO|Doc\.?\s*No)',
+                   full, re.I | re.S)
+    if mt:
+        title = re.sub(r'\s+', ' ', mt.group(1)).strip()
+        title = re.sub(r'(\w)-\s+(\w)', r'\1-\2', title)  # fix line-break hyphens
+    if doc_no and title:
+        return f"{doc_no}_{title}"
+    return doc_no or title or ""
+
 # Words/phrases that signal a page carries reviewer comments rather than
-# pure spec-sheet boilerplate. Used to prioritise pages for the LLM.
+# pure spec-sheet boilerplate. Used only to decide what to keep if a document
+# is too long for the budget.
 COMMENT_SIGNALS = re.compile(
     r'\b(shall|should|to be|required|ensure|provide|verify|comply|complian'
     r'|approved|vendor|deviation|clarification|as per|not acceptable'
@@ -79,29 +93,28 @@ COMMENT_SIGNALS = re.compile(
 )
 
 def prioritise_pages(pages_text, char_budget=24000):
-    """Order pages by how comment-like they are, then pack up to char_budget.
-    This keeps comment pages even when the document is long."""
+    """Keep pages in DOCUMENT ORDER (so comments stay top-to-bottom).
+    Only when the total exceeds the budget do we drop the lowest-signal pages,
+    but the pages we keep are always re-emitted in their original order."""
+    total = sum(len(t) for t in pages_text)
+    if total <= char_budget:
+        return "\n".join(pages_text)
     scored = []
     for i, t in enumerate(pages_text):
         score = len(COMMENT_SIGNALS.findall(t))
         scored.append((score, i, t))
-    # comment-rich pages first; preserve original order among equal scores
     scored.sort(key=lambda x: (-x[0], x[1]))
-    out, used = [], 0
+    keep_idx, used = set(), 0
     for score, i, t in scored:
         if used + len(t) > char_budget:
-            t = t[:max(0, char_budget - used)]
-        if t:
-            out.append(t)
-            used += len(t)
-        if used >= char_budget:
-            break
-    return "\n".join(out)
+            continue
+        keep_idx.add(i)
+        used += len(t)
+    kept = [pages_text[i] for i in range(len(pages_text)) if i in keep_idx]
+    return "\n".join(kept)
 
 # ============================================================================
-# COMMENT SPLITTER (backstop for when the model still merges a numbered list)
-# Splits only on clear "N) " list markers. Will NOT break "1.5 sq mm",
-# "26 29 23", "433V", "80-100 microns", etc.
+# COMMENT SPLITTER
 # ============================================================================
 def split_merged_comments(comments_list):
     result = []
@@ -114,7 +127,6 @@ def split_merged_comments(comments_list):
             result.append(comment.strip())
     return result
 
-# Lines that are headers/instructions, not actual review comments.
 HEADER_PATTERNS = re.compile(
     r'^(clarification|clarifications required|following points|following items'
     r'|please incorporate|please note the following|comments?:?$)',
@@ -129,8 +141,6 @@ def drop_headers(comments_list):
         out.append(c)
     return out
 
-# Remove an inline lead-in that precedes the first real item, e.g.
-# "Clarifications required for following points wrt the Jacobs specifications: Approved vendors..."
 LEADIN = re.compile(
     r'^(clarifications?\s+required[^:]*:\s*'
     r'|following\s+(?:points|items)[^:]*:\s*'
@@ -148,7 +158,7 @@ PROMPT_TEMPLATE = """You are extracting reviewer comments from an engineering su
 
 Below is the text of a submittal PDF. Reviewers have added comments/markups requesting clarifications or changes.
 
-Extract EVERY distinct reviewer comment as its own separate item.
+Extract EVERY distinct reviewer comment as its own separate item, in the order they appear in the text.
 
 STRICT RULES:
 - Each comment = ONE distinct instruction, requirement, or question.
@@ -164,10 +174,10 @@ SUBMITTAL TEXT:
 
 JSON:"""
 
-async def extract_one(session, zip_name, pdf_text, sem):
+async def extract_one(session, zip_name, pdf_text, doc_name, sem):
     sub_id = submittal_id_from_name(zip_name)
     if not pdf_text.strip():
-        return {"submittal": sub_id, "comments": [], "error": "No text in PDF"}
+        return {"submittal": sub_id, "document": doc_name, "comments": [], "error": "No text in PDF"}
 
     prompt = PROMPT_TEMPLATE.format(body=pdf_text)
     payload = {
@@ -185,31 +195,26 @@ async def extract_one(session, zip_name, pdf_text, sem):
                                     headers=headers, timeout=60) as resp:
                 if resp.status != 200:
                     txt = await resp.text()
-                    return {"submittal": sub_id, "comments": [],
+                    return {"submittal": sub_id, "document": doc_name, "comments": [],
                             "error": f"API {resp.status}: {txt[:80]}"}
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"]
         except Exception as e:
-            return {"submittal": sub_id, "comments": [], "error": str(e)[:80]}
+            return {"submittal": sub_id, "document": doc_name, "comments": [], "error": str(e)[:80]}
 
-    # Parse JSON out of the response
     try:
         start = content.find("{")
         end = content.rfind("}")
         if start == -1 or end == -1:
             print(f"DEBUG {sub_id}: No JSON found. Response: {content[:200]}")
-            return {"submittal": sub_id, "comments": [], "error": "No JSON in response"}
+            return {"submittal": sub_id, "document": doc_name, "comments": [], "error": "No JSON in response"}
         parsed = json.loads(content[start:end+1])
         raw = parsed.get("comments", [])
         print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from Groq")
     except Exception as e:
         print(f"DEBUG {sub_id}: Parse error: {e}. Response: {content[:200]}")
-        return {"submittal": sub_id, "comments": [], "error": f"Parse failed: {str(e)[:40]}"}
+        return {"submittal": sub_id, "document": doc_name, "comments": [], "error": f"Parse failed: {str(e)[:40]}"}
 
-    # Clean: strip any leading numbering the model added, then SPLIT merged
-    # numbered blocks, THEN drop header/lead-in fragments. Order matters:
-    # splitting first turns "Clarifications required: 1) X 2) Y" into a header
-    # fragment + the real items, so dropping headers keeps X and Y.
     cleaned = []
     for c in raw:
         if not isinstance(c, str):
@@ -219,11 +224,10 @@ async def extract_one(session, zip_name, pdf_text, sem):
             cleaned.append(c)
     cleaned = split_merged_comments(cleaned)
     cleaned = drop_headers(cleaned)
-    # also strip a leading "header: " lead-in that sits inline before the first item
     cleaned = [strip_leadin(c) for c in cleaned]
     cleaned = [c for c in cleaned if len(c) >= 3]
 
-    return {"submittal": sub_id, "comments": cleaned, "error": None}
+    return {"submittal": sub_id, "document": doc_name, "comments": cleaned, "error": None}
 
 async def process_all(zip_files, progress_cb=None):
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -233,7 +237,8 @@ async def process_all(zip_files, progress_cb=None):
         for zip_name, zip_bytes in zip_files:
             pages = extract_pdf_text(zip_bytes)
             text = prioritise_pages(pages)
-            tasks.append(extract_one(session, zip_name, text, sem))
+            doc_name = extract_doc_name(pages)
+            tasks.append(extract_one(session, zip_name, text, doc_name, sem))
         done = 0
         for coro in asyncio.as_completed(tasks):
             res = await coro
@@ -241,13 +246,12 @@ async def process_all(zip_files, progress_cb=None):
             done += 1
             if progress_cb:
                 progress_cb(done, len(tasks))
-    # keep input order by submittal id
     order = {submittal_id_from_name(n): i for i, (n, _) in enumerate(zip_files)}
     results.sort(key=lambda r: order.get(r["submittal"], 999))
     return results
 
 # ============================================================================
-# EXCEL (matches TPL_Comments.xlsx exactly)
+# EXCEL
 # ============================================================================
 def build_excel(results):
     wb = openpyxl.Workbook()
@@ -262,7 +266,6 @@ def build_excel(results):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     cnr_fill = PatternFill("solid", fgColor="FFF2CC")
 
-    # EXACT header text from the template (note the typo + trailing space)
     headers = ["Sr no.", "Submittal", "Document ", "Costumer Comments", "Xylem Remarks"]
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=col, value=h)
@@ -275,24 +278,18 @@ def build_excel(results):
         comments = r["comments"]
         has = bool(comments)
         n = max(1, len(comments))
-        block_start = row
 
         for k in range(n):
             first = (k == 0)
-            # Sr no.
             c = ws.cell(row=row, column=1, value=(sr if first else None))
             c.alignment = center; c.border = border
-            # Submittal
             c = ws.cell(row=row, column=2, value=(r["submittal"] if first else None))
             c.alignment = left; c.border = border
-            # Document  (LLM path has no doc name; left blank, kept for format parity)
-            c = ws.cell(row=row, column=3, value=("" if first else None))
+            c = ws.cell(row=row, column=3, value=(r.get("document", "") if first else None))
             c.alignment = left; c.border = border
-            # Costumer Comments — one per row, numbered
             val = f"{k+1}. {comments[k]}" if has else ""
             c = ws.cell(row=row, column=4, value=val)
             c.alignment = left; c.border = border
-            # Xylem Remarks
             if first and not has:
                 c = ws.cell(row=row, column=5, value="Comment not Received")
                 c.fill = cnr_fill
@@ -301,10 +298,6 @@ def build_excel(results):
             c.alignment = left; c.border = border
             row += 1
 
-        if n > 1:
-            for col in (1, 2, 3, 5):
-                ws.merge_cells(start_row=block_start, start_column=col,
-                               end_row=row-1, end_column=col)
         sr += 1
 
     last = row - 1
