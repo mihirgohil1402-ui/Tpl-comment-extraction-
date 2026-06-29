@@ -44,11 +44,12 @@ def extract_pdf_text(zip_bytes):
     """Pull text from PDFs inside the ZIP using pdfplumber.
 
     Reviewer comments live in the *_annotated.pdf as positioned callout text on
-    drawing pages. PyPDF2 misses/garbles that; pdfplumber reads it correctly.
-    We prefer the annotated PDF when present (that's where the comments are),
-    otherwise fall back to all PDFs.
+    drawing pages, which sit toward the END of the document (after spec tables
+    and boilerplate). We collect per-page text, then order pages so the ones
+    most likely to contain reviewer comments come FIRST — otherwise a length
+    cap would chop off exactly the pages we care about.
     """
-    text_parts = []
+    pages_text = []
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
             all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
@@ -61,12 +62,41 @@ def extract_pdf_text(zip_bytes):
                         for page in pdf.pages:
                             t = page.extract_text() or ""
                             if t.strip():
-                                text_parts.append(t)
+                                pages_text.append(t)
                 except Exception:
                     pass
     except Exception:
         pass
-    return "\n".join(text_parts)
+    return pages_text
+
+# Words/phrases that signal a page carries reviewer comments rather than
+# pure spec-sheet boilerplate. Used to prioritise pages for the LLM.
+COMMENT_SIGNALS = re.compile(
+    r'\b(shall|should|to be|required|ensure|provide|verify|comply|complian'
+    r'|approved|vendor|deviation|clarification|as per|not acceptable'
+    r'|to be furnished|to be considered|consult|review)\b',
+    re.I
+)
+
+def prioritise_pages(pages_text, char_budget=24000):
+    """Order pages by how comment-like they are, then pack up to char_budget.
+    This keeps comment pages even when the document is long."""
+    scored = []
+    for i, t in enumerate(pages_text):
+        score = len(COMMENT_SIGNALS.findall(t))
+        scored.append((score, i, t))
+    # comment-rich pages first; preserve original order among equal scores
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out, used = [], 0
+    for score, i, t in scored:
+        if used + len(t) > char_budget:
+            t = t[:max(0, char_budget - used)]
+        if t:
+            out.append(t)
+            used += len(t)
+        if used >= char_budget:
+            break
+    return "\n".join(out)
 
 # ============================================================================
 # COMMENT SPLITTER (backstop for when the model still merges a numbered list)
@@ -139,7 +169,7 @@ async def extract_one(session, zip_name, pdf_text, sem):
     if not pdf_text.strip():
         return {"submittal": sub_id, "comments": [], "error": "No text in PDF"}
 
-    prompt = PROMPT_TEMPLATE.format(body=pdf_text[:12000])
+    prompt = PROMPT_TEMPLATE.format(body=pdf_text)
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -201,7 +231,8 @@ async def process_all(zip_files, progress_cb=None):
     async with aiohttp.ClientSession() as session:
         tasks = []
         for zip_name, zip_bytes in zip_files:
-            text = extract_pdf_text(zip_bytes)
+            pages = extract_pdf_text(zip_bytes)
+            text = prioritise_pages(pages)
             tasks.append(extract_one(session, zip_name, text, sem))
         done = 0
         for coro in asyncio.as_completed(tasks):
@@ -346,4 +377,3 @@ if uploaded:
                 st.markdown(f"**{r['submittal']}** — {len(r['comments'])} comment(s)")
                 for i, c in enumerate(r["comments"], 1):
                     st.write(f"{i}. {c}")
-                    
