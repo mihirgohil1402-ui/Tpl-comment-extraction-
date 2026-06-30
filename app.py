@@ -25,17 +25,7 @@ st.set_page_config(page_title="TPL Comment Extractor", layout="wide")
 # ============================================================================
 # CONFIG
 # ============================================================================
-GROQ_API_KEY = st.secrets.get("groq_api_key", "")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-
-# Keep concurrency low: the free tier has a small memory budget AND a per-minute
-# rate limit. 2 at a time, with retry/backoff below, keeps us under both.
 CONCURRENCY = 2
-
-# Groq free tier has rate limits. When we hit one (HTTP 429), we fail fast
-# with a clear message instead of hanging. The user should wait and retry.
-# No magic retries — they won't add quota we don't have.
 
 # ============================================================================
 # PDF / ZIP HELPERS
@@ -218,39 +208,68 @@ SUBMITTAL TEXT:
 
 JSON:"""
 
-async def _groq_request(session, prompt):
-    """POST to Groq. If rate-limited (429), fail fast with clear error."""
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": 3000,
-    }
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
-               "Content-Type": "application/json"}
+async def _api_request(session, api_choice, api_key, model, prompt):
+    """Call the selected API (Groq, OpenAI, or Claude).
+    Returns (content_str, error_str). Exactly one is non-None."""
+    
+    if api_choice == "groq":
+        url = "https://api.groq.com/openai/v1/chat/completions"
+    elif api_choice == "openai":
+        url = "https://api.openai.com/v1/chat/completions"
+    elif api_choice == "claude":
+        url = "https://api.anthropic.com/v1/messages"
+    else:
+        return None, f"Unknown API: {api_choice}"
+    
+    if not api_key:
+        return None, f"No API key provided for {api_choice}"
+    
+    # Claude uses a different message format
+    if api_choice == "claude":
+        payload = {
+            "model": model,
+            "max_tokens": 3000,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        headers = {"Authorization": f"Bearer {api_key}",
+                   "Content-Type": "application/json",
+                   "anthropic-version": "2023-06-01"}
+    else:
+        # Groq and OpenAI use OpenAI-compatible format
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 3000,
+        }
+        headers = {"Authorization": f"Bearer {api_key}",
+                   "Content-Type": "application/json"}
 
     try:
-        async with session.post(GROQ_API_URL, json=payload,
-                                headers=headers, timeout=90) as resp:
+        async with session.post(url, json=payload, headers=headers, timeout=90) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"], None
+                # Extract content based on API response format
+                if api_choice == "claude":
+                    return data["content"][0]["text"], None
+                else:  # Groq, OpenAI
+                    return data["choices"][0]["message"]["content"], None
             if resp.status == 429:
-                return None, "Rate limited (HTTP 429). You've hit Groq's free-tier cap. Wait a few minutes and retry."
+                return None, f"Rate limited (HTTP 429) on {api_choice}. Wait and retry."
             txt = await resp.text()
             return None, f"API {resp.status}: {txt[:80]}"
     except Exception as e:
         return None, str(e)[:80]
 
-async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
-    """Call Groq (with retry) and clean the result."""
+async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable, api_choice, api_key, model):
+    """Call the selected API and clean the result."""
     sub_id = submittal_id_from_name(zip_name)
     base = {"submittal": sub_id, "document": doc_name, "unreadable": unreadable}
     if not pdf_text.strip():
         return {**base, "comments": [], "error": "No text in PDF"}
 
     prompt = PROMPT_TEMPLATE.format(body=pdf_text)
-    content, err = await _groq_request(session, prompt)
+    content, err = await _api_request(session, api_choice, api_key, model, prompt)
     if err:
         print(f"DEBUG {sub_id}: {err}")
         return {**base, "comments": [], "error": err}
@@ -263,7 +282,7 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
             return {**base, "comments": [], "error": "No JSON in response"}
         parsed = json.loads(content[start:end+1])
         raw = parsed.get("comments", [])
-        print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from Groq")
+        print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from {api_choice}")
     except Exception as e:
         print(f"DEBUG {sub_id}: Parse error: {e}. Response: {content[:200]}")
         return {**base, "comments": [], "error": f"Parse failed: {str(e)[:40]}"}
@@ -282,7 +301,7 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
 
     return {**base, "comments": cleaned, "error": None}
 
-async def _process_one(session, zip_name, zip_bytes, sem):
+async def _process_one(session, zip_name, zip_bytes, sem, api_choice, api_key, model):
     """Extract text for ONE zip and call the LLM, under the semaphore so only
     CONCURRENCY PDFs are in memory at once. Frees PDF bytes and gc's between."""
     async with sem:
@@ -300,7 +319,7 @@ async def _process_one(session, zip_name, zip_bytes, sem):
                 text = prioritise_pages(pages)
                 pages = None
                 gc.collect()
-                res = await _llm_only(session, zip_name, text, doc_name, unreadable)
+                res = await _llm_only(session, zip_name, text, doc_name, unreadable, api_choice, api_key, model)
         except Exception as e:
             res = {"submittal": submittal_id_from_name(zip_name),
                    "document": "", "unreadable": 0,
@@ -308,12 +327,12 @@ async def _process_one(session, zip_name, zip_bytes, sem):
         gc.collect()
         return res
 
-async def process_all(zip_files, progress_cb=None):
+async def process_all(zip_files, api_choice, api_key, model, progress_cb=None):
     sem = asyncio.Semaphore(CONCURRENCY)
     results = []
     async with aiohttp.ClientSession() as session:
         tasks = [
-            _process_one(session, zip_name, zip_bytes, sem)
+            _process_one(session, zip_name, zip_bytes, sem, api_choice, api_key, model)
             for zip_name, zip_bytes in zip_files
         ]
         done = 0
@@ -410,8 +429,32 @@ st.title("TPL Comment Extractor")
 st.caption("Upload submittal ZIPs. Comments are extracted by an LLM in parallel, "
            "split into individual items, and written to the TPL Excel format.")
 
-if not GROQ_API_KEY:
-    st.error("Groq API key not set. Add `groq_api_key` to .streamlit/secrets.toml")
+# Sidebar: API selection and key
+with st.sidebar:
+    st.header("API Settings")
+    api_choice = st.selectbox("Select API", ["groq", "openai", "claude"], 
+                              help="Choose which LLM service to use")
+    api_key = st.text_input(f"{api_choice.upper()} API Key", type="password",
+                            help=f"Enter your {api_choice.upper()} API key")
+    
+    model_map = {
+        "groq": "llama-3.3-70b-versatile",
+        "openai": "gpt-4-turbo",
+        "claude": "claude-opus-4-6"
+    }
+    model = st.text_input("Model", value=model_map[api_choice],
+                         help="Leave default or enter custom model name")
+    
+    st.divider()
+    st.subheader("Tools")
+    if st.button("Clear results & free memory"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        gc.collect()
+        st.rerun()
+
+if not api_key:
+    st.error(f"No API key provided. Enter your {api_choice.upper()} API key in the sidebar.")
     st.stop()
 
 uploaded = st.file_uploader("Upload ZIP files", type="zip",
@@ -428,8 +471,8 @@ if uploaded:
             bar.progress(done / total)
             status.text(f"Processed {done}/{total} submittals...")
 
-        status.text("Sending to Groq...")
-        results = asyncio.run(process_all(zip_files, cb))
+        status.text(f"Sending to {api_choice.upper()}...")
+        results = asyncio.run(process_all(zip_files, api_choice, api_key, model, cb))
         status.text("Building Excel...")
 
         wb = build_excel(results)
@@ -452,23 +495,5 @@ if uploaded:
         st.subheader("Summary")
         st.write(f"Submittals processed: {len(results)}")
         st.write(f"Total comments extracted: {total}")
-        if errs:
-            st.warning(f"{len(errs)} submittal(s) had issues:")
-            for r in errs:
-                st.write(f"- {r['submittal']}: {r['error']}")
-
-        with st.expander("Preview extracted comments"):
-            for r in results:
-                st.markdown(f"**{r['submittal']}** — {len(r['comments'])} comment(s)")
-                for i, c in enumerate(r["comments"], 1):
-                    st.write(f"{i}. {c}")
-
-        gc.collect()
-
-st.divider()
-if st.button("Clear results & free memory"):
-    for k in list(st.session_state.keys()):
-        del st.session_state[k]
-    gc.collect()
-    st.rerun()
-        
+        st.write(f"API used: {api_choice.upper()}")
+      
