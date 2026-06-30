@@ -62,7 +62,7 @@ SUPPORTED_APIS = {
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         "format": "openai",
-        "models": ["gemini-2.0-flash", "gemini-1.5-flash"],
+        "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
     },
     "mistral": {
         "url": "https://api.mistral.ai/v1/chat/completions",
@@ -318,9 +318,10 @@ async def _api_request(session, api_choice, api_key, model, prompt):
                 except (KeyError, IndexError, TypeError) as e:
                     return None, f"Unexpected response shape: {str(e)[:60]}"
             if resp.status == 429:
-                return None, f"Rate limited (HTTP 429) on {api_choice}. Wait and retry, or switch API."
+                txt = await resp.text()
+                return None, f"429 on {api_choice}: {txt[:200]}"
             txt = await resp.text()
-            return None, f"API {resp.status}: {txt[:80]}"
+            return None, f"API {resp.status}: {txt[:200]}"
     except Exception as e:
         return None, str(e)[:80]
 
