@@ -27,6 +27,63 @@ st.set_page_config(page_title="TPL Comment Extractor", layout="wide")
 # ============================================================================
 CONCURRENCY = 2
 
+# ----------------------------------------------------------------------------
+# SUPPORTED APIS — add a new LLM service by adding an entry here.
+# No need to touch any function logic below.
+#
+# Each entry needs:
+#   url           : the chat/completions endpoint
+#   format        : "openai" (Groq, OpenAI, Mistral, DeepSeek, Gemini-compat,
+#                   Together, OpenRouter, local Ollama...) or "anthropic" (Claude)
+#   models        : list of model IDs (first one is the default in the dropdown)
+#   extra_headers : (optional) dict of extra headers, e.g. Claude's version
+#
+# MOST modern APIs are "openai" format (OpenAI-compatible). Only Claude uses
+# the "anthropic" format. To add a new OpenAI-compatible API, copy a block,
+# change url + models, done.
+# ----------------------------------------------------------------------------
+SUPPORTED_APIS = {
+    "groq": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "format": "openai",
+        "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    },
+    "openai": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "format": "openai",
+        "models": ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini"],
+    },
+    "claude": {
+        "url": "https://api.anthropic.com/v1/messages",
+        "format": "anthropic",
+        "models": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
+        "extra_headers": {"anthropic-version": "2023-06-01"},
+    },
+    "gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "format": "openai",
+        "models": ["gemini-2.0-flash", "gemini-1.5-flash"],
+    },
+    "mistral": {
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "format": "openai",
+        "models": ["mistral-large-latest", "mistral-small-latest"],
+    },
+    "deepseek": {
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "format": "openai",
+        "models": ["deepseek-chat"],
+    },
+    # ---- To add your own, copy this template and fill it in: ----
+    # "myapi": {
+    #     "url": "https://api.example.com/v1/chat/completions",
+    #     "format": "openai",          # or "anthropic"
+    #     "models": ["model-id-here"],
+    #     # "extra_headers": {"some-header": "value"},   # optional
+    # },
+}
+
+
 # ============================================================================
 # PDF / ZIP HELPERS
 # ============================================================================
@@ -209,53 +266,59 @@ SUBMITTAL TEXT:
 JSON:"""
 
 async def _api_request(session, api_choice, api_key, model, prompt):
-    """Call the selected API (Groq, OpenAI, or Claude).
-    Returns (content_str, error_str). Exactly one is non-None."""
-    
-    if api_choice == "groq":
-        url = "https://api.groq.com/openai/v1/chat/completions"
-    elif api_choice == "openai":
-        url = "https://api.openai.com/v1/chat/completions"
-    elif api_choice == "claude":
-        url = "https://api.anthropic.com/v1/messages"
-    else:
+    """Call the selected API using its config from SUPPORTED_APIS.
+    Returns (content_str, error_str). Exactly one is non-None.
+
+    Reads everything (url, format, headers) from the SUPPORTED_APIS dict, so
+    adding a new API is just a new dict entry — no changes needed here."""
+
+    cfg = SUPPORTED_APIS.get(api_choice)
+    if cfg is None:
         return None, f"Unknown API: {api_choice}"
-    
     if not api_key:
         return None, f"No API key provided for {api_choice}"
-    
-    # Claude uses a different message format
-    if api_choice == "claude":
+
+    url = cfg["url"]
+    fmt = cfg.get("format", "openai")
+
+    # Build headers
+    headers = {"Content-Type": "application/json"}
+    if fmt == "anthropic":
+        headers["x-api-key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    # any extra headers from config (e.g. Claude's anthropic-version)
+    for k, v in cfg.get("extra_headers", {}).items():
+        headers[k] = v
+
+    # Build payload in the right format
+    if fmt == "anthropic":
         payload = {
             "model": model,
             "max_tokens": 3000,
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": [{"role": "user", "content": prompt}],
         }
-        headers = {"Authorization": f"Bearer {api_key}",
-                   "Content-Type": "application/json",
-                   "anthropic-version": "2023-06-01"}
-    else:
-        # Groq and OpenAI use OpenAI-compatible format
+    else:  # openai-compatible
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
             "max_tokens": 3000,
         }
-        headers = {"Authorization": f"Bearer {api_key}",
-                   "Content-Type": "application/json"}
 
     try:
         async with session.post(url, json=payload, headers=headers, timeout=90) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Extract content based on API response format
-                if api_choice == "claude":
-                    return data["content"][0]["text"], None
-                else:  # Groq, OpenAI
-                    return data["choices"][0]["message"]["content"], None
+                try:
+                    if fmt == "anthropic":
+                        return data["content"][0]["text"], None
+                    else:
+                        return data["choices"][0]["message"]["content"], None
+                except (KeyError, IndexError, TypeError) as e:
+                    return None, f"Unexpected response shape: {str(e)[:60]}"
             if resp.status == 429:
-                return None, f"Rate limited (HTTP 429) on {api_choice}. Wait and retry."
+                return None, f"Rate limited (HTTP 429) on {api_choice}. Wait and retry, or switch API."
             txt = await resp.text()
             return None, f"API {resp.status}: {txt[:80]}"
     except Exception as e:
@@ -433,15 +496,17 @@ st.caption("Upload submittal ZIPs. Comments are extracted by an LLM in parallel,
 st.subheader("1. Choose API")
 col1, col2 = st.columns(2)
 with col1:
-    api_choice = st.selectbox("API Service", ["groq", "openai", "claude"],
+    api_choice = st.selectbox("API Service", list(SUPPORTED_APIS.keys()),
                               help="Choose which LLM service to use")
 with col2:
-    model_map = {
-        "groq": "llama-3.3-70b-versatile",
-        "openai": "gpt-4-turbo",
-        "claude": "claude-opus-4-6"
-    }
-    model = st.text_input("Model", value=model_map[api_choice])
+    available_models = SUPPORTED_APIS[api_choice]["models"]
+    model = st.selectbox("Model", available_models,
+                         help="Pick a model, or type a custom one below")
+
+custom_model = st.text_input("Custom model (optional)", value="",
+                             help="Override the model above with any model ID")
+if custom_model.strip():
+    model = custom_model.strip()
 
 api_key = st.text_input(f"{api_choice.upper()} API Key", type="password",
                         help=f"Paste your {api_choice.upper()} API key here")
