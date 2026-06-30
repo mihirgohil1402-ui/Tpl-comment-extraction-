@@ -74,6 +74,11 @@ SUPPORTED_APIS = {
         "format": "openai",
         "models": ["deepseek-chat"],
     },
+    "together": {
+        "url": "https://api.together.ai/v1/chat/completions",
+        "format": "openai",
+        "models": ["meta-llama/Llama-3-70b-chat-hf", "openai/gpt-oss-20b", "mistralai/Mistral-7B-Instruct-v0.1"],
+    },
     # ---- To add your own, copy this template and fill it in: ----
     # "myapi": {
     #     "url": "https://api.example.com/v1/chat/completions",
