@@ -295,7 +295,7 @@ async def _api_request(session, api_choice, api_key, model, prompt):
     if fmt == "anthropic":
         payload = {
             "model": model,
-            "max_tokens": 3000,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         }
     else:  # openai-compatible
@@ -303,7 +303,7 @@ async def _api_request(session, api_choice, api_key, model, prompt):
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 3000,
+            "max_tokens": 4096,
         }
 
     try:
@@ -338,18 +338,39 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable, api_choic
         print(f"DEBUG {sub_id}: {err}")
         return {**base, "comments": [], "error": err}
 
+    # Clean common wrappers: markdown fences, "json" label, leading prose
+    raw_content = content
+    content = content.strip()
+    # remove ```json ... ``` or ``` ... ``` fences
+    content = re.sub(r'^```(?:json)?\s*', '', content)
+    content = re.sub(r'\s*```$', '', content)
+
+    parsed = None
     try:
         start = content.find("{")
         end = content.rfind("}")
-        if start == -1 or end == -1:
-            print(f"DEBUG {sub_id}: No JSON found. Response: {content[:200]}")
-            return {**base, "comments": [], "error": "No JSON in response"}
-        parsed = json.loads(content[start:end+1])
-        raw = parsed.get("comments", [])
-        print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from {api_choice}")
-    except Exception as e:
-        print(f"DEBUG {sub_id}: Parse error: {e}. Response: {content[:200]}")
-        return {**base, "comments": [], "error": f"Parse failed: {str(e)[:40]}"}
+        if start != -1 and end != -1 and end > start:
+            parsed = json.loads(content[start:end+1])
+    except Exception:
+        parsed = None
+
+    # Fallback: try to salvage a comments array even if outer JSON is malformed
+    if parsed is None:
+        try:
+            # find "comments": [ ... ]
+            m = re.search(r'"comments"\s*:\s*\[(.*?)\]', content, re.S)
+            if m:
+                items = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+                parsed = {"comments": [i.encode().decode('unicode_escape') for i in items]}
+        except Exception:
+            parsed = None
+
+    if parsed is None:
+        print(f"DEBUG {sub_id}: No JSON. Raw response: {raw_content[:300]}")
+        return {**base, "comments": [], "error": f"No JSON in response (got: {raw_content[:40]})"}
+
+    raw = parsed.get("comments", [])
+    print(f"DEBUG {sub_id}: Parsed {len(raw)} comments from {api_choice}")
 
     cleaned = []
     for c in raw:
