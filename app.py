@@ -429,32 +429,34 @@ st.title("TPL Comment Extractor")
 st.caption("Upload submittal ZIPs. Comments are extracted by an LLM in parallel, "
            "split into individual items, and written to the TPL Excel format.")
 
-# Sidebar: API selection and key
-with st.sidebar:
-    st.header("API Settings")
-    api_choice = st.selectbox("Select API", ["groq", "openai", "claude"], 
+# API selection — in the main page so it's always visible (mobile-friendly)
+st.subheader("1. Choose API")
+col1, col2 = st.columns(2)
+with col1:
+    api_choice = st.selectbox("API Service", ["groq", "openai", "claude"],
                               help="Choose which LLM service to use")
-    api_key = st.text_input(f"{api_choice.upper()} API Key", type="password",
-                            help=f"Enter your {api_choice.upper()} API key")
-    
+with col2:
     model_map = {
         "groq": "llama-3.3-70b-versatile",
         "openai": "gpt-4-turbo",
         "claude": "claude-opus-4-6"
     }
-    model = st.text_input("Model", value=model_map[api_choice],
-                         help="Leave default or enter custom model name")
-    
-    st.divider()
-    st.subheader("Tools")
-    if st.button("Clear results & free memory"):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        gc.collect()
-        st.rerun()
+    model = st.text_input("Model", value=model_map[api_choice])
+
+api_key = st.text_input(f"{api_choice.upper()} API Key", type="password",
+                        help=f"Paste your {api_choice.upper()} API key here")
+
+if st.button("Clear results & free memory"):
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    gc.collect()
+    st.rerun()
+
+st.divider()
+st.subheader("2. Upload & Extract")
 
 if not api_key:
-    st.error(f"No API key provided. Enter your {api_choice.upper()} API key in the sidebar.")
+    st.warning(f"Enter your {api_choice.upper()} API key above to begin.")
     st.stop()
 
 uploaded = st.file_uploader("Upload ZIP files", type="zip",
@@ -496,4 +498,15 @@ if uploaded:
         st.write(f"Submittals processed: {len(results)}")
         st.write(f"Total comments extracted: {total}")
         st.write(f"API used: {api_choice.upper()}")
-      
+        if errs:
+            st.warning(f"{len(errs)} submittal(s) had issues:")
+            for r in errs:
+                st.write(f"- {r['submittal']}: {r['error']}")
+
+        with st.expander("Preview extracted comments"):
+            for r in results:
+                st.markdown(f"**{r['submittal']}** — {len(r['comments'])} comment(s)")
+                for i, c in enumerate(r["comments"], 1):
+                    st.write(f"{i}. {c}")
+
+        gc.collect()
