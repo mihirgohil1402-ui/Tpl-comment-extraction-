@@ -29,11 +29,14 @@ GROQ_API_KEY = st.secrets.get("groq_api_key", "")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 
-# How many submittals to send to Groq at once. The Streamlit free tier has a
-# small memory budget, and pdfplumber loads each PDF (including heavy scanned
-# images) fully into RAM. Holding many open at once is what crashes the app, so
-# we keep this low. 2 is safe; raise cautiously if the host has more memory.
+# Keep concurrency low: the free tier has a small memory budget AND a per-minute
+# rate limit. 2 at a time, with retry/backoff below, keeps us under both.
 CONCURRENCY = 2
+
+# Retry settings for Groq rate limits (HTTP 429). When the free tier throttles,
+# we wait and retry instead of recording 0 comments.
+MAX_RETRIES = 5
+BASE_BACKOFF = 8  # seconds; grows 8, 16, 24, 32... and honours Retry-After
 
 # ============================================================================
 # PDF / ZIP HELPERS
@@ -64,7 +67,6 @@ def extract_pdf_text(zip_bytes):
             comment_pdfs = [f for f in all_pdfs
                             if 'annotated' in f.lower() or 'response' in f.lower()]
             if not comment_pdfs:
-                # No markup/response file -> no reviewer comments at all.
                 return [], 0, False
             had_comment_file = True
             for name in comment_pdfs:
@@ -75,7 +77,6 @@ def extract_pdf_text(zip_bytes):
                             t = page.extract_text() or ""
                             if t.strip():
                                 pages_text.append(t)
-                            # low/no text but has images = possible scanned page
                             if len(t.strip()) < 50:
                                 try:
                                     if len(page.images) > 0:
@@ -88,13 +89,29 @@ def extract_pdf_text(zip_bytes):
         pass
     return pages_text, unreadable_pages, had_comment_file
 
+def extract_doc_name(pages_text):
+    """Build '{DOC_NO}_{Title}' from the cover-page text (Document column)."""
+    full = "\n".join(pages_text[:3])
+    doc_no = None
+    m = re.search(r'\b(TPL-[A-Z0-9]+-\d+-[A-Z]+-[A-Z]+-\d+)\b', full, re.I)
+    if m:
+        doc_no = m.group(1)
+    title = None
+    mt = re.search(r'(?:Document Title:|Doc\.?\s*Title:)\s*(.+?)(?:DOC\s*NO|Doc\.?\s*No)',
+                   full, re.I | re.S)
+    if mt:
+        title = re.sub(r'\s+', ' ', mt.group(1)).strip()
+        title = re.sub(r'(\w)-\s+(\w)', r'\1-\2', title)
+    if doc_no and title:
+        return f"{doc_no}_{title}"
+    return doc_no or title or ""
+
 def extract_doc_name_from_zip(zip_bytes):
     """Get the document name from ANY pdf in the zip (lead sheet / datasheet),
     so the Document column is filled even when there are no comments."""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
             all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
-            # prefer a datasheet/lead sheet (has the cover info)
             for name in all_pdfs:
                 try:
                     raw = zf.read(name)
@@ -113,25 +130,8 @@ def extract_doc_name_from_zip(zip_bytes):
         pass
     return ""
 
-def extract_doc_name(pages_text):
-    """Build '{DOC_NO}_{Title}' from the cover-page text (Document column)."""
-    full = "\n".join(pages_text[:3])
-    doc_no = None
-    m = re.search(r'\b(TPL-[A-Z0-9]+-\d+-[A-Z]+-[A-Z]+-\d+)\b', full, re.I)
-    if m:
-        doc_no = m.group(1)
-    title = None
-    mt = re.search(r'(?:Document Title:|Doc\.?\s*Title:)\s*(.+?)(?:DOC\s*NO|Doc\.?\s*No)',
-                   full, re.I | re.S)
-    if mt:
-        title = re.sub(r'\s+', ' ', mt.group(1)).strip()
-        title = re.sub(r'(\w)-\s+(\w)', r'\1-\2', title)  # fix line-break hyphens
-    if doc_no and title:
-        return f"{doc_no}_{title}"
-    return doc_no or title or ""
-
 # Words/phrases that signal a page carries reviewer comments rather than
-# pure spec-sheet boilerplate. Used to prioritise pages for the LLM.
+# pure spec-sheet boilerplate. Used to prioritise pages if a doc is too long.
 COMMENT_SIGNALS = re.compile(
     r'\b(shall|should|to be|required|ensure|provide|verify|comply|complian'
     r'|approved|vendor|deviation|clarification|as per|not acceptable'
@@ -140,9 +140,7 @@ COMMENT_SIGNALS = re.compile(
 )
 
 def prioritise_pages(pages_text, char_budget=24000):
-    """Keep pages in DOCUMENT ORDER (so comments stay 1,2,3 top-to-bottom).
-    Only when the total exceeds the budget do we drop the lowest-signal pages,
-    but the pages we keep are always re-emitted in their original order."""
+    """Keep pages in DOCUMENT ORDER. Only drop lowest-signal pages if over budget."""
     total = sum(len(t) for t in pages_text)
     if total <= char_budget:
         return "\n".join(pages_text)
@@ -161,9 +159,7 @@ def prioritise_pages(pages_text, char_budget=24000):
     return "\n".join(kept)
 
 # ============================================================================
-# COMMENT SPLITTER (backstop for when the model still merges a numbered list)
-# Splits only on clear "N) " list markers. Will NOT break "1.5 sq mm",
-# "26 29 23", "433V", "80-100 microns", etc.
+# COMMENT SPLITTER
 # ============================================================================
 def split_merged_comments(comments_list):
     result = []
@@ -176,7 +172,6 @@ def split_merged_comments(comments_list):
             result.append(comment.strip())
     return result
 
-# Lines that are headers/instructions, not actual review comments.
 HEADER_PATTERNS = re.compile(
     r'^(clarification|clarifications required|following points|following items'
     r'|please incorporate|please note the following|comments?:?$)',
@@ -191,8 +186,6 @@ def drop_headers(comments_list):
         out.append(c)
     return out
 
-# Remove an inline lead-in that precedes the first real item, e.g.
-# "Clarifications required for following points wrt the Jacobs specifications: Approved vendors..."
 LEADIN = re.compile(
     r'^(clarifications?\s+required[^:]*:\s*'
     r'|following\s+(?:points|items)[^:]*:\s*'
@@ -210,7 +203,7 @@ PROMPT_TEMPLATE = """You are extracting reviewer comments from an engineering su
 
 Below is the text of a submittal PDF. Reviewers have added comments/markups requesting clarifications or changes.
 
-Extract EVERY distinct reviewer comment as its own separate item.
+Extract EVERY distinct reviewer comment as its own separate item, in the order they appear in the text.
 
 STRICT RULES:
 - Each comment = ONE distinct instruction, requirement, or question.
@@ -226,15 +219,9 @@ SUBMITTAL TEXT:
 
 JSON:"""
 
-async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
-    """Call Groq and clean the result. Semaphore is held by the caller
-    (_process_one), so we don't acquire it here."""
-    sub_id = submittal_id_from_name(zip_name)
-    base = {"submittal": sub_id, "document": doc_name, "unreadable": unreadable}
-    if not pdf_text.strip():
-        return {**base, "comments": [], "error": "No text in PDF"}
-
-    prompt = PROMPT_TEMPLATE.format(body=pdf_text)
+async def _groq_request(session, prompt):
+    """POST to Groq with retry/backoff on 429 (rate limit) and 5xx.
+    Returns (content_str, error_str). Exactly one is non-None."""
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -244,19 +231,51 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
                "Content-Type": "application/json"}
 
-    try:
-        async with session.post(GROQ_API_URL, json=payload,
-                                headers=headers, timeout=60) as resp:
-            if resp.status != 200:
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with session.post(GROQ_API_URL, json=payload,
+                                    headers=headers, timeout=90) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"], None
+                if resp.status == 429 or resp.status >= 500:
+                    # rate limited or server error -> wait and retry
+                    retry_after = resp.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except ValueError:
+                            wait = BASE_BACKOFF * (attempt + 1)
+                    else:
+                        wait = BASE_BACKOFF * (attempt + 1)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(wait)
+                        continue
+                    txt = await resp.text()
+                    return None, f"API {resp.status} after {MAX_RETRIES} tries: {txt[:60]}"
+                # other 4xx -> don't retry
                 txt = await resp.text()
-                return {**base, "comments": [],
-                        "error": f"API {resp.status}: {txt[:80]}"}
-            data = await resp.json()
-            content = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return {**base, "comments": [], "error": str(e)[:80]}
+                return None, f"API {resp.status}: {txt[:80]}"
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(BASE_BACKOFF * (attempt + 1))
+                continue
+            return None, str(e)[:80]
+    return None, "Exhausted retries"
 
-    # Parse JSON out of the response
+async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
+    """Call Groq (with retry) and clean the result."""
+    sub_id = submittal_id_from_name(zip_name)
+    base = {"submittal": sub_id, "document": doc_name, "unreadable": unreadable}
+    if not pdf_text.strip():
+        return {**base, "comments": [], "error": "No text in PDF"}
+
+    prompt = PROMPT_TEMPLATE.format(body=pdf_text)
+    content, err = await _groq_request(session, prompt)
+    if err:
+        print(f"DEBUG {sub_id}: {err}")
+        return {**base, "comments": [], "error": err}
+
     try:
         start = content.find("{")
         end = content.rfind("}")
@@ -285,16 +304,14 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
     return {**base, "comments": cleaned, "error": None}
 
 async def _process_one(session, zip_name, zip_bytes, sem):
-    """Extract text for ONE zip and call the LLM, all under the semaphore so
-    only CONCURRENCY PDFs are ever in memory at once. Frees the PDF bytes and
-    runs gc before returning so memory doesn't accumulate across 28 files."""
+    """Extract text for ONE zip and call the LLM, under the semaphore so only
+    CONCURRENCY PDFs are in memory at once. Frees PDF bytes and gc's between."""
     async with sem:
         try:
             pages, unreadable, had_comment_file = extract_pdf_text(zip_bytes)
             doc_name = extract_doc_name_from_zip(zip_bytes)
             if not had_comment_file:
                 # No annotated/response PDF -> genuinely no reviewer comments.
-                # Don't call the LLM (avoids inventing comments from datasheets).
                 zip_bytes = None
                 res = {"submittal": submittal_id_from_name(zip_name),
                        "document": doc_name, "unreadable": 0,
@@ -347,9 +364,6 @@ def build_excel(results):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     cnr_fill = PatternFill("solid", fgColor="FFF2CC")
 
-    # EXACT header text from the template (note the typo + trailing space).
-    # Column 6 "Review Note" is added by this tool to flag pages it could not
-    # read as text (possible scanned reviewer comments needing manual review).
     headers = ["Sr no.", "Submittal", "Document ", "Costumer Comments",
                "Xylem Remarks", "Review Note"]
     for col, h in enumerate(headers, 1):
@@ -363,31 +377,24 @@ def build_excel(results):
         comments = r["comments"]
         has = bool(comments)
         n = max(1, len(comments))
-        block_start = row
 
         for k in range(n):
             first = (k == 0)
-            # Sr no.
             c = ws.cell(row=row, column=1, value=(sr if first else None))
             c.alignment = center; c.border = border
-            # Submittal
             c = ws.cell(row=row, column=2, value=(r["submittal"] if first else None))
             c.alignment = left; c.border = border
-            # Document — only first row of the block
             c = ws.cell(row=row, column=3, value=(r.get("document", "") if first else None))
             c.alignment = left; c.border = border
-            # Costumer Comments — one per row, numbered
             val = f"{k+1}. {comments[k]}" if has else ""
             c = ws.cell(row=row, column=4, value=val)
             c.alignment = left; c.border = border
-            # Xylem Remarks
             if first and not has:
                 c = ws.cell(row=row, column=5, value="Comment not Received")
                 c.fill = cnr_fill
             else:
                 c = ws.cell(row=row, column=5, value=None)
             c.alignment = left; c.border = border
-            # Review Note (col 6) — only first row of block
             if first:
                 unread = r.get("unreadable", 0)
                 if unread > 0:
@@ -403,10 +410,6 @@ def build_excel(results):
             cn.alignment = left; cn.border = border
             row += 1
 
-        if n > 1:
-            # No merging — ideal keeps each comment in its own separate cell,
-            # with Sr/Submittal/Document only on the first row and blank below.
-            pass
         sr += 1
 
     last = row - 1
@@ -444,9 +447,9 @@ if uploaded:
         status = st.empty()
         def cb(done, total):
             bar.progress(done / total)
-            status.text(f"Processed {done}/{total} submittals...")
+            status.text(f"Processed {done}/{total} submittals... (auto-retries on rate limit)")
 
-        status.text("Sending to Groq in parallel...")
+        status.text("Sending to Groq...")
         results = asyncio.run(process_all(zip_files, cb))
         status.text("Building Excel...")
 
@@ -481,14 +484,10 @@ if uploaded:
                 for i, c in enumerate(r["comments"], 1):
                     st.write(f"{i}. {c}")
 
-        # Nudge garbage collection after a run to release PDF/text memory.
         gc.collect()
 
 st.divider()
 if st.button("Clear results & free memory"):
-    # Wipe uploaded files and any cached run data, force garbage collection,
-    # and reload the app to a clean state. Use this between large batches if
-    # the app feels sluggish.
     for k in list(st.session_state.keys()):
         del st.session_state[k]
     gc.collect()
