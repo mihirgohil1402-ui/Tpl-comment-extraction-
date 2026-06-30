@@ -33,10 +33,9 @@ GROQ_MODEL   = "llama-3.3-70b-versatile"
 # rate limit. 2 at a time, with retry/backoff below, keeps us under both.
 CONCURRENCY = 2
 
-# Retry settings for Groq rate limits (HTTP 429). When the free tier throttles,
-# we wait and retry instead of recording 0 comments.
-MAX_RETRIES = 5
-BASE_BACKOFF = 8  # seconds; grows 8, 16, 24, 32... and honours Retry-After
+# Groq free tier has rate limits. When we hit one (HTTP 429), we fail fast
+# with a clear message instead of hanging. The user should wait and retry.
+# No magic retries — they won't add quota we don't have.
 
 # ============================================================================
 # PDF / ZIP HELPERS
@@ -220,8 +219,7 @@ SUBMITTAL TEXT:
 JSON:"""
 
 async def _groq_request(session, prompt):
-    """POST to Groq with retry/backoff on 429 (rate limit) and 5xx.
-    Returns (content_str, error_str). Exactly one is non-None."""
+    """POST to Groq. If rate-limited (429), fail fast with clear error."""
     payload = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -231,37 +229,18 @@ async def _groq_request(session, prompt):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
                "Content-Type": "application/json"}
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with session.post(GROQ_API_URL, json=payload,
-                                    headers=headers, timeout=90) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["choices"][0]["message"]["content"], None
-                if resp.status == 429 or resp.status >= 500:
-                    # rate limited or server error -> wait and retry
-                    retry_after = resp.headers.get("retry-after")
-                    if retry_after:
-                        try:
-                            wait = float(retry_after)
-                        except ValueError:
-                            wait = BASE_BACKOFF * (attempt + 1)
-                    else:
-                        wait = BASE_BACKOFF * (attempt + 1)
-                    if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep(wait)
-                        continue
-                    txt = await resp.text()
-                    return None, f"API {resp.status} after {MAX_RETRIES} tries: {txt[:60]}"
-                # other 4xx -> don't retry
-                txt = await resp.text()
-                return None, f"API {resp.status}: {txt[:80]}"
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(BASE_BACKOFF * (attempt + 1))
-                continue
-            return None, str(e)[:80]
-    return None, "Exhausted retries"
+    try:
+        async with session.post(GROQ_API_URL, json=payload,
+                                headers=headers, timeout=90) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"], None
+            if resp.status == 429:
+                return None, "Rate limited (HTTP 429). You've hit Groq's free-tier cap. Wait a few minutes and retry."
+            txt = await resp.text()
+            return None, f"API {resp.status}: {txt[:80]}"
+    except Exception as e:
+        return None, str(e)[:80]
 
 async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable):
     """Call Groq (with retry) and clean the result."""
@@ -447,7 +426,7 @@ if uploaded:
         status = st.empty()
         def cb(done, total):
             bar.progress(done / total)
-            status.text(f"Processed {done}/{total} submittals... (auto-retries on rate limit)")
+            status.text(f"Processed {done}/{total} submittals...")
 
         status.text("Sending to Groq...")
         results = asyncio.run(process_all(zip_files, cb))
@@ -492,3 +471,4 @@ if st.button("Clear results & free memory"):
         del st.session_state[k]
     gc.collect()
     st.rerun()
+        
