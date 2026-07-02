@@ -393,15 +393,53 @@ def _read_page_annotations(page):
     return texts
 
 
+# Filename keywords that mark a PDF as comment-bearing. Broader than just
+# annotated/response so common conventions are caught by name alone.
+COMMENT_NAME_KEYWORDS = ('annotated', 'response', 'markup', 'marked',
+                         'comment', 'reply')
+
+
+def _name_says_comments(pdf_name):
+    nl = pdf_name.lower()
+    return any(k in nl for k in COMMENT_NAME_KEYWORDS)
+
+
+def _looks_like_reviewer_note(txt):
+    """Sentence-like annotation text = reviewer comment. CAD drawings also
+    carry FreeText annotations, but those are short ALL-CAPS fragments (part
+    numbers, materials, 'ALL DIMENSION ARE IN MM') — never sentences with
+    lowercase words."""
+    return (len(txt) >= 30 and len(txt.split()) >= 5
+            and re.search(r'[a-z]', txt) is not None)
+
+
+def _has_reviewer_annotations(raw):
+    """Does this PDF carry at least one sentence-like markup annotation?
+    Used to catch comment-bearing PDFs whose filename doesn't say so."""
+    try:
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            for page in pdf.pages:
+                for t in _read_page_annotations(page):
+                    if _looks_like_reviewer_note(t):
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 def extract_pdf_text(pdf_items, treat_all_as_comments=False):
     """Pull text from the COMMENT-bearing PDFs using pdfplumber.
 
-    Reviewer comments live only in an annotated markup PDF ('*_annotated*') or a
-    reviewer 'Response' PDF. The plain datasheet and the submittal lead sheet
-    contain NO reviewer comments — reading them makes the LLM invent "comments"
-    out of spec-sheet text (false positives). So:
-      - If a comment file (annotated/response) exists, read only that.
-      - If NONE exists, the submittal has no reviewer comments: return empty.
+    Reviewer comments live only in an annotated markup PDF or a reviewer
+    'Response' PDF. The plain datasheet and the submittal lead sheet contain
+    NO reviewer comments — reading them makes the LLM invent "comments" out
+    of spec-sheet text (false positives). Selection is therefore:
+      - every PDF whose NAME contains a comment keyword (annotated, response,
+        markup, comment, reply, ...), PLUS
+      - every PDF whose CONTENT carries sentence-like markup annotations
+        (a Response PDF can arrive with any filename — selecting on name
+        alone made the ZIP path miss files the direct-PDF path processed).
+      - If neither finds anything, the submittal has no reviewer comments.
       - treat_all_as_comments=True (a directly-uploaded PDF, which has no
         sibling files to compare against) reads every given PDF.
 
@@ -420,8 +458,12 @@ def extract_pdf_text(pdf_items, treat_all_as_comments=False):
     if treat_all_as_comments:
         comment_pdfs = list(pdf_items)
     else:
-        comment_pdfs = [(n, b) for n, b in pdf_items
-                        if 'annotated' in n.lower() or 'response' in n.lower()]
+        chosen = {n for n, _ in pdf_items if _name_says_comments(n)}
+        for n, b in pdf_items:
+            if n not in chosen and _has_reviewer_annotations(b):
+                chosen.add(n)
+        # keep original archive order so comment order is stable
+        comment_pdfs = [(n, b) for n, b in pdf_items if n in chosen]
         if not comment_pdfs:
             return [], [], 0, False
     for name, raw in comment_pdfs:
@@ -478,15 +520,45 @@ DOC_NO_FALLBACK_RE = re.compile(
     re.I
 )
 
-# Title labels seen across annotated / response / datasheet / lead sheets.
-TITLE_LABEL_RE = re.compile(
-    r'(?:Document\s*Title|Doc\.?\s*Title|Drawing\s*Title|Document\s*Name'
-    r'|Doc\.?\s*Name|Name\s*of\s*(?:the\s*)?Document'
-    r'|Title|Subject|Description)\s*[:\-]\s*'
-    r'(.+?)'
-    r'(?:\s*(?:DOC\s*NO|Doc\.?\s*No|Document\s*No|Rev\b|Revision|Sheet\b|Page\b|$))',
-    re.I | re.S
+# A title value that starts with the document number ("<DOCNO>_<title>" — the
+# lead sheet's Subject field is exactly this) gives both pieces at once.
+DOC_NO_PREFIX_RE = re.compile(
+    r'^(TPL-[A-Z0-9]+-\d+-[A-Z]+-[A-Z]+-\d+)[\s_:\-]+(.+)$', re.I | re.S)
+
+# What ENDS a title value. Deliberately precise: 'DOC NO:', 'Rev 0',
+# 'Sheet 1', 'Page 2' end a title — but the WORDS 'sheet'/'rev' inside a
+# title ("Pump Technical Data sheet for CWTP...") must never truncate it
+# (that truncation was why the Document column lost half its titles).
+_TITLE_STOP = (
+    r'DOC(?:UMENT)?\.?\s*(?:NO|NUMBER)\b'
+    r'|Rev(?:ision)?\.?\s*(?:No)?\.?\s*[:.]?\s*\d'
+    r'|Sheet\s*(?:No\b|\d)'
+    r'|Page\s*(?:No\b|\d)'
+    r'|Document\s*/\s*Dwg'
+    r'|Location\s*:'
+    r'|List\s+Attachments'
+    r'|$'
 )
+
+
+def _title_rx(label):
+    return re.compile(label + r'\s*[:\-]\s*(.+?)\s*(?:' + _TITLE_STOP + r')',
+                      re.I | re.S)
+
+
+# Ordered label list: (priority, compiled regex). All matches from every
+# label on every PDF are collected; the best candidate wins (priority first,
+# then completeness/length). A candidate carrying the DOCNO_ prefix gets a
+# large boost — it is the exact target format.
+TITLE_LABELS = [
+    (4, _title_rx(r'(?:Document|Doc\.?|Drawing|Drg\.?)\s*Title')),
+    (3, _title_rx(r'(?:Document|Doc\.?)\s*Name')),
+    (3, _title_rx(r'Name\s*of\s*(?:the\s*)?Document')),
+    (2, _title_rx(r'\bSubject')),
+    (2, _title_rx(r'\bTitle')),
+    (1, _title_rx(r'\bDescription')),
+    (1, _title_rx(r'\bName')),
+]
 
 
 def _clean_title(raw):
@@ -498,45 +570,75 @@ def _clean_title(raw):
     return t
 
 
-def extract_doc_name(pages_text):
-    """Build '{DOC_NO}_{Title}' from the first few pages of one PDF."""
-    full = "\n".join(pages_text[:3])
-    doc_no = None
-    m = DOC_NO_RE.search(full)
-    if m:
-        doc_no = m.group(1)
-    title = None
-    mt = TITLE_LABEL_RE.search(full)
-    if mt:
-        cand = _clean_title(mt.group(1))
-        # guard against grabbing a whole paragraph
-        if 0 < len(cand) <= 120:
-            title = cand
-    if doc_no and title:
-        return f"{doc_no}_{title}"
-    return doc_no or title or ""
+def _title_candidates(full_text):
+    """All labelled title candidates in one PDF's text.
+    Returns a list of (priority, title, doc_no_or_empty)."""
+    out = []
+    for prio, rx in TITLE_LABELS:
+        for m in rx.finditer(full_text):
+            cand = _clean_title(m.group(1))
+            if not (0 < len(cand) <= 160):
+                continue
+            pm = DOC_NO_PREFIX_RE.match(cand)
+            if pm:
+                title = _clean_title(pm.group(2))
+                if 0 < len(title) <= 160:
+                    out.append((prio + 10, title, pm.group(1)))
+            else:
+                out.append((prio, cand, ""))
+    return out
+
+
+def _layout_titles(full_text):
+    """Label-free fallback: in these header blocks the title lines sit
+    directly ABOVE the 'DOC NO' line (below a bare 'Document Title:' label
+    on its own line). Collect up to 3 preceding non-label lines."""
+    out = []
+    lines = full_text.split("\n")
+    for i, ln in enumerate(lines):
+        if re.match(r'\s*DOC(?:UMENT)?\.?\s*(?:NO|NUMBER)\b', ln, re.I):
+            grab = []
+            for prev in reversed(lines[max(0, i - 3):i]):
+                s = prev.strip()
+                if not s or s.endswith(':'):
+                    break
+                grab.insert(0, s)
+            cand = _clean_title(" ".join(grab))
+            if 0 < len(cand) <= 160 and re.search(r'[a-z]', cand):
+                out.append(cand)
+    return out
+
+
+def _title_from_filenames(pdf_items):
+    """Last resort: attachment PDFs are named '001_<title>.pdf'."""
+    for name, _ in pdf_items:
+        base = name.rsplit('/', 1)[-1]
+        base = re.sub(r'\.pdf$', '', base, flags=re.I)
+        base = re.sub(r'_annotated$', '', base, flags=re.I)
+        m = re.match(r'^\d{2,4}[_\- ]+(.{8,160})$', base)
+        if m and re.search(r'[a-z]', m.group(1)):
+            return _clean_title(m.group(1))
+    return ""
 
 
 def extract_doc_name_from_items(pdf_items):
     """Search EVERY PDF (from a ZIP or a single upload) for the document name.
 
-    Strategy:
-      1. Try each PDF; collect the best doc_no and best title found anywhere
-         (number and title may come from DIFFERENT PDFs — they are combined).
-      2. Prefer a result that has BOTH number and title.
-      3. Fall back to whichever single piece exists.
-    The column only stays blank if NO pdf yields either piece.
+    Strategy (all candidates are collected before choosing — never stop at
+    the first match, and number/title may come from DIFFERENT PDFs):
+      1. Labelled fields on the first pages of every PDF (Document Title,
+         Drawing Title, Document Name, Subject, Title, Description, Name).
+         A value shaped '<DOCNO>_<title>' (the lead sheet's Subject field)
+         wins outright — it is the exact target format.
+      2. Best labelled candidate by (priority, completeness/length).
+      3. Header-layout fallback: title lines directly above the DOC NO line.
+      4. Filename fallback: attachment PDFs named '001_<title>.pdf'.
+      5. Only return a partial result if every strategy failed.
     """
     best_doc_no = ""
-    best_title = ""
-    # Order: annotated/response first (usually have the header block),
-    # then everything else (datasheet, lead sheet).
-    def rank(item):
-        nl = item[0].lower()
-        if 'annotated' in nl or 'response' in nl:
-            return 0
-        return 1
-    for name, raw in sorted(pdf_items, key=rank):
+    candidates = []       # (priority, title)
+    layout = []           # label-free fallback candidates
+    for name, raw in pdf_items:
         try:
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
                 pages = []
@@ -544,27 +646,28 @@ def extract_doc_name_from_items(pdf_items):
                     t = p.extract_text() or ""
                     if t.strip():
                         pages.append(t)
-                full = "\n".join(pages)
-
-                if not best_doc_no:
-                    m = DOC_NO_RE.search(full)
-                    if m:
-                        best_doc_no = m.group(1)
-                    else:
-                        m = DOC_NO_FALLBACK_RE.search(full)
-                        if m:
-                            best_doc_no = m.group(1).strip()
-                if not best_title:
-                    mt = TITLE_LABEL_RE.search(full)
-                    if mt:
-                        cand = _clean_title(mt.group(1))
-                        if 0 < len(cand) <= 120:
-                            best_title = cand
-
-                if best_doc_no and best_title:
-                    return f"{best_doc_no}_{best_title}"
+            full = "\n".join(pages)
         except Exception:
-            pass
+            continue
+
+        if not best_doc_no:
+            m = DOC_NO_RE.search(full) or DOC_NO_FALLBACK_RE.search(full)
+            if m:
+                best_doc_no = m.group(1).strip()
+        for prio, title, docno in _title_candidates(full):
+            if docno and not best_doc_no:
+                best_doc_no = docno
+            candidates.append((prio, title))
+        layout.extend(_layout_titles(full))
+
+    best_title = ""
+    if candidates:
+        best_title = max(candidates, key=lambda c: (c[0], len(c[1])))[1]
+    elif layout:
+        best_title = max(layout, key=len)
+    if not best_title:
+        best_title = _title_from_filenames(pdf_items)
+
     if best_doc_no and best_title:
         return f"{best_doc_no}_{best_title}"
     return best_doc_no or best_title or ""
