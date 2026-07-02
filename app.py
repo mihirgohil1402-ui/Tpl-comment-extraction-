@@ -5,8 +5,9 @@
 #   (optional OCR) pip install pytesseract pillow  + Tesseract binary
 #   streamlit run app.py
 #
-# Single-file Streamlit app. Upload submittal ZIPs -> reviewer comments are
-# extracted by an LLM -> written to the exact TPL_Comments.xlsx format.
+# Single-file Streamlit app. Upload submittal ZIPs (or standalone submittal
+# PDFs) -> reviewer comments are extracted by an LLM -> written to the exact
+# TPL_Comments.xlsx format.
 
 import streamlit as st
 import zipfile
@@ -31,6 +32,16 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# pdfminer (bundled with pdfplumber) decodes PDF text strings (UTF-16BE /
+# PDFDocEncoding). Used when reading annotation /Contents raw bytes.
+try:
+    from pdfminer.utils import decode_text as _decode_pdf_text
+except Exception:
+    def _decode_pdf_text(b):
+        if b[:2] == b"\xfe\xff":
+            return b[2:].decode("utf-16-be", "replace")
+        return b.decode("latin-1", "replace")
+
 st.set_page_config(page_title="TPL Comment Extractor", layout="wide")
 
 # ============================================================================
@@ -46,6 +57,8 @@ BACKOFF_BASE      = 2.0     # exponential backoff base (seconds): 2,4,8,...
 BACKOFF_CAP       = 30.0    # never wait more than this between retries
 REQUEST_TIMEOUT   = 90      # seconds per HTTP request
 CHARS_PER_TOKEN   = 4.0     # rough token estimate (≈4 chars/token English)
+MAX_CHUNKS_PER_DOC = 12     # emergency cap on requests per document; only a
+                            # pathological doc ever hits this (12 x 24k chars)
 
 # ----------------------------------------------------------------------------
 # SUPPORTED APIS — add a new LLM service by adding an entry here.
@@ -133,6 +146,7 @@ class ApiKey:
         self.total_failures = 0
         self.total_429 = 0
         self._429_streak = 0          # consecutive 429s -> grows backoff
+        self.dead = False             # permanent auth failure (401/403)
 
     def available(self, now):
         return now >= self.cooldown_until
@@ -140,13 +154,17 @@ class ApiKey:
     def cooldown_remaining(self, now):
         return max(0.0, self.cooldown_until - now)
 
-    def mark_429(self, now):
-        """Put this key on exponential-backoff cooldown. Doesn't retry it now."""
+    def mark_429(self, now, retry_after=None):
+        """Put this key on exponential-backoff cooldown. Doesn't retry it now.
+        Honours the server's Retry-After when it is longer than our own
+        backoff, so we never knock on a door the server told us is closed."""
         self.total_429 += 1
         self.total_failures += 1
         self.retry_count += 1
         self._429_streak += 1
         wait = min(BACKOFF_BASE ** self._429_streak, BACKOFF_CAP)
+        if retry_after:
+            wait = max(wait, min(float(retry_after), 120.0))
         self.cooldown_until = now + wait
 
     def mark_other_failure(self, now):
@@ -155,6 +173,12 @@ class ApiKey:
         self.retry_count += 1
         wait = min(BACKOFF_BASE ** 1, BACKOFF_CAP)
         self.cooldown_until = now + wait
+
+    def mark_dead(self):
+        """Permanent auth failure (401/403): never schedule this key again."""
+        self.dead = True
+        self.total_failures += 1
+        self.retry_count += 1
 
     def mark_success(self):
         self._429_streak = 0          # reset backoff growth on success
@@ -190,6 +214,9 @@ class KeyPool:
     def has_any(self):
         return len(self.keys) > 0
 
+    def has_usable(self):
+        return any(not k.dead for k in self.keys)
+
     def _provider_rank(self, provider):
         if provider in PROVIDER_PRIORITY:
             return PROVIDER_PRIORITY.index(provider)
@@ -201,12 +228,14 @@ class KeyPool:
         - If all keys are cooling down: (soonest_key, seconds_to_wait) so the
           caller can sleep then use it (requirement 6: retry oldest exhausted).
         - If pool is empty: (None, 0.0)."""
-        if not self.keys:
+        # Dead keys (401/403) are never scheduled again.
+        alive = [k for k in self.keys if not k.dead]
+        if not alive:
             return None, 0.0
 
         # 1) Prefer any AVAILABLE key, ordered by provider priority then a
         #    round-robin tiebreak within the pool.
-        available = [k for k in self.keys if k.available(now)]
+        available = [k for k in alive if k.available(now)]
         if available:
             def sort_key(k):
                 rr = self._rr.get(k.provider, 0)
@@ -222,7 +251,7 @@ class KeyPool:
         #    Tie-break by provider priority. This implements "retry the oldest
         #    exhausted key after backoff", preferring Gemini then Groq.
         soonest = min(
-            self.keys,
+            alive,
             key=lambda k: (k.cooldown_until, self._provider_rank(k.provider))
         )
         return soonest, soonest.cooldown_remaining(now)
@@ -309,14 +338,63 @@ def est_tokens(text):
 # ============================================================================
 # PDF / ZIP HELPERS
 # ============================================================================
-def submittal_id_from_name(zip_name):
-    """SUB1715-_ Rev No_ 0.zip  ->  SUB1715"""
-    m = re.search(r'(SUB\d+)', zip_name, re.I)
-    return m.group(1).upper() if m else zip_name.replace('.zip', '')
+def submittal_id_from_name(file_name):
+    """SUB1715-_ Rev No_ 0.zip  ->  SUB1715   (works for .pdf uploads too)"""
+    m = re.search(r'(SUB\d+)', file_name, re.I)
+    if m:
+        return m.group(1).upper()
+    return re.sub(r'\.(zip|pdf)$', '', file_name, flags=re.I)
 
 
-def extract_pdf_text(zip_bytes):
-    """Pull text from the COMMENT-bearing PDF inside the ZIP using pdfplumber.
+def _pdf_items_from_upload(file_name, file_bytes):
+    """Normalise an upload into [(pdf_name, pdf_bytes), ...].
+    A .pdf upload is a one-item list; a .zip contributes every PDF inside."""
+    if file_name.lower().endswith('.pdf'):
+        return [(file_name, file_bytes)]
+    items = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zf:
+        for n in zf.namelist():
+            if n.lower().endswith('.pdf'):
+                items.append((n, zf.read(n)))
+    return items
+
+
+def _read_page_annotations(page):
+    """Reviewer markups saved as live annotation objects (FreeText callouts,
+    notes) never appear in extract_text() — their text lives in the
+    annotation's /Contents. Read it directly. Link/Popup/Widget annotations
+    are navigation chrome, not comments; stamps/shapes without text are
+    skipped automatically because their /Contents is empty."""
+    texts = []
+    try:
+        annots = page.annots or []
+    except Exception:
+        return texts
+    for a in annots:
+        try:
+            data = a.get("data") or {}
+            sub = data.get("Subtype")
+            sub_name = getattr(sub, "name", "") or (str(sub) if sub else "")
+            if sub_name in ("Link", "Popup", "Widget"):
+                continue
+            raw = a.get("contents")
+            if raw is None:
+                raw = data.get("Contents")
+            if isinstance(raw, bytes):
+                try:
+                    raw = _decode_pdf_text(raw)
+                except Exception:
+                    raw = raw.decode("latin-1", "replace")
+            txt = re.sub(r'\s+', ' ', str(raw)).strip() if raw else ""
+            if txt:
+                texts.append(txt)
+        except Exception:
+            continue
+    return texts
+
+
+def extract_pdf_text(pdf_items, treat_all_as_comments=False):
+    """Pull text from the COMMENT-bearing PDFs using pdfplumber.
 
     Reviewer comments live only in an annotated markup PDF ('*_annotated*') or a
     reviewer 'Response' PDF. The plain datasheet and the submittal lead sheet
@@ -324,53 +402,65 @@ def extract_pdf_text(zip_bytes):
     out of spec-sheet text (false positives). So:
       - If a comment file (annotated/response) exists, read only that.
       - If NONE exists, the submittal has no reviewer comments: return empty.
+      - treat_all_as_comments=True (a directly-uploaded PDF, which has no
+        sibling files to compare against) reads every given PDF.
+
+    Comments stored as live annotation objects (FreeText callouts in
+    'Response' PDFs) are read via /Contents in page order; annotation text
+    that is already flattened into the page text is not duplicated.
 
     Falls back to OCR if a page has images but no extractable text.
 
-    Returns (pages_text, unreadable_pages, had_comment_file).
+    Returns (pages_text, pages_annots, unreadable_pages, had_comment_file);
+    pages_text[i] and pages_annots[i] describe the same page, in order.
     """
     pages_text = []
+    pages_annots = []
     unreadable_pages = 0
-    had_comment_file = False
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-            all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
-            comment_pdfs = [f for f in all_pdfs
-                            if 'annotated' in f.lower() or 'response' in f.lower()]
-            if not comment_pdfs:
-                return [], 0, False
-            had_comment_file = True
-            for name in comment_pdfs:
-                try:
-                    raw = zf.read(name)
-                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                        for page in pdf.pages:
-                            t = page.extract_text() or ""
-                            has_images = False
-                            try:
-                                has_images = len(page.images) > 0
-                            except Exception:
-                                pass
+    if treat_all_as_comments:
+        comment_pdfs = list(pdf_items)
+    else:
+        comment_pdfs = [(n, b) for n, b in pdf_items
+                        if 'annotated' in n.lower() or 'response' in n.lower()]
+        if not comment_pdfs:
+            return [], [], 0, False
+    for name, raw in comment_pdfs:
+        try:
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text() or ""
+                    has_images = False
+                    try:
+                        has_images = len(page.images) > 0
+                    except Exception:
+                        pass
 
-                            # OCR fallback: page has images but no real text
-                            if len(t.strip()) < 50 and has_images and OCR_AVAILABLE:
-                                try:
-                                    img = page.to_image()
-                                    ocr_text = pytesseract.image_to_string(img.original)
-                                    if len(ocr_text.strip()) > len(t.strip()):
-                                        t = ocr_text
-                                except Exception:
-                                    pass
+                    # OCR fallback: page has images but no real text
+                    if len(t.strip()) < 50 and has_images and OCR_AVAILABLE:
+                        try:
+                            img = page.to_image()
+                            ocr_text = pytesseract.image_to_string(img.original)
+                            if len(ocr_text.strip()) > len(t.strip()):
+                                t = ocr_text
+                        except Exception:
+                            pass
 
-                            if t.strip():
-                                pages_text.append(t)
-                            if len(t.strip()) < 50 and has_images:
-                                unreadable_pages += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return pages_text, unreadable_pages, had_comment_file
+                    annot_texts = _read_page_annotations(page)
+                    # Avoid duplicates: skip annotation text that is already
+                    # flattened into this page's text layer.
+                    if annot_texts:
+                        page_norm = re.sub(r'\s+', ' ', t).lower()
+                        annot_texts = [x for x in annot_texts
+                                       if x[:60].lower() not in page_norm]
+
+                    if t.strip() or annot_texts:
+                        pages_text.append(t)
+                        pages_annots.append(annot_texts)
+                    if len(t.strip()) < 50 and has_images:
+                        unreadable_pages += 1
+        except Exception:
+            pass
+    return pages_text, pages_annots, unreadable_pages, True
 
 
 # --- Document name extraction ------------------------------------------------
@@ -380,9 +470,19 @@ def extract_pdf_text(zip_bytes):
 
 DOC_NO_RE = re.compile(r'\b(TPL-[A-Z0-9]+-\d+-[A-Z]+-[A-Z]+-\d+)\b', re.I)
 
+# Fallback for documents that don't use the TPL-... scheme: take whatever
+# identifier follows an explicit "Doc No / Document Number" label.
+DOC_NO_FALLBACK_RE = re.compile(
+    r'DOC(?:UMENT)?\.?\s*(?:NO|NUMBER)\.?\s*[:\-]?\s*'
+    r'([A-Z][A-Z0-9][A-Z0-9\-/\.]{3,40}\d)',
+    re.I
+)
+
 # Title labels seen across annotated / response / datasheet / lead sheets.
 TITLE_LABEL_RE = re.compile(
-    r'(?:Document\s*Title|Doc\.?\s*Title|Title|Subject|Description)\s*[:\-]\s*'
+    r'(?:Document\s*Title|Doc\.?\s*Title|Drawing\s*Title|Document\s*Name'
+    r'|Doc\.?\s*Name|Name\s*of\s*(?:the\s*)?Document'
+    r'|Title|Subject|Description)\s*[:\-]\s*'
     r'(.+?)'
     r'(?:\s*(?:DOC\s*NO|Doc\.?\s*No|Document\s*No|Rev\b|Revision|Sheet\b|Page\b|$))',
     re.I | re.S
@@ -417,58 +517,57 @@ def extract_doc_name(pages_text):
     return doc_no or title or ""
 
 
-def extract_doc_name_from_zip(zip_bytes):
-    """Search EVERY PDF in the ZIP for the document name.
+def extract_doc_name_from_items(pdf_items):
+    """Search EVERY PDF (from a ZIP or a single upload) for the document name.
 
     Strategy:
-      1. Try each PDF; collect the best doc_no and best title found anywhere.
+      1. Try each PDF; collect the best doc_no and best title found anywhere
+         (number and title may come from DIFFERENT PDFs — they are combined).
       2. Prefer a result that has BOTH number and title.
       3. Fall back to whichever single piece exists.
     The column only stays blank if NO pdf yields either piece.
     """
-    best_combined = ""      # has both no + title
     best_doc_no = ""
     best_title = ""
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-            all_pdfs = [f for f in zf.namelist() if f.lower().endswith('.pdf')]
-            # Order: annotated/response first (usually have the header block),
-            # then everything else (datasheet, lead sheet).
-            def rank(n):
-                nl = n.lower()
-                if 'annotated' in nl or 'response' in nl:
-                    return 0
-                return 1
-            for name in sorted(all_pdfs, key=rank):
-                try:
-                    raw = zf.read(name)
-                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                        pages = []
-                        for p in pdf.pages[:3]:
-                            t = p.extract_text() or ""
-                            if t.strip():
-                                pages.append(t)
-                        full = "\n".join(pages[:3])
+    # Order: annotated/response first (usually have the header block),
+    # then everything else (datasheet, lead sheet).
+    def rank(item):
+        nl = item[0].lower()
+        if 'annotated' in nl or 'response' in nl:
+            return 0
+        return 1
+    for name, raw in sorted(pdf_items, key=rank):
+        try:
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                pages = []
+                for p in pdf.pages[:3]:
+                    t = p.extract_text() or ""
+                    if t.strip():
+                        pages.append(t)
+                full = "\n".join(pages)
 
-                        if not best_doc_no:
-                            m = DOC_NO_RE.search(full)
-                            if m:
-                                best_doc_no = m.group(1)
-                        if not best_title:
-                            mt = TITLE_LABEL_RE.search(full)
-                            if mt:
-                                cand = _clean_title(mt.group(1))
-                                if 0 < len(cand) <= 120:
-                                    best_title = cand
+                if not best_doc_no:
+                    m = DOC_NO_RE.search(full)
+                    if m:
+                        best_doc_no = m.group(1)
+                    else:
+                        m = DOC_NO_FALLBACK_RE.search(full)
+                        if m:
+                            best_doc_no = m.group(1).strip()
+                if not best_title:
+                    mt = TITLE_LABEL_RE.search(full)
+                    if mt:
+                        cand = _clean_title(mt.group(1))
+                        if 0 < len(cand) <= 120:
+                            best_title = cand
 
-                        if best_doc_no and best_title:
-                            best_combined = f"{best_doc_no}_{best_title}"
-                            return best_combined
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return best_combined or best_doc_no or best_title or ""
+                if best_doc_no and best_title:
+                    return f"{best_doc_no}_{best_title}"
+        except Exception:
+            pass
+    if best_doc_no and best_title:
+        return f"{best_doc_no}_{best_title}"
+    return best_doc_no or best_title or ""
 
 
 # ============================================================================
@@ -488,22 +587,27 @@ def _norm_line(line):
 
 
 def dedupe_boilerplate(pages_text):
-    """Drop lines that repeat across MULTIPLE pages (headers/footers/boilerplate).
+    """Drop REPEATS of lines that appear on multiple pages (headers/footers).
 
     Keeps:
       - every line that appears on only one page (unique content, incl. comments)
-      - one copy is NOT kept for repeated lines: repeated == boilerplate here,
-        because genuine reviewer comments do not repeat verbatim across pages.
+      - the FIRST occurrence of a repeated line. Repeated lines are almost
+        always headers/footers, but a genuine comment stamped on two pages
+        would previously vanish entirely — keeping one copy costs a few
+        tokens and can never lose content (duplicate extracted comments are
+        removed after the LLM step anyway).
     Safety: if a page would be emptied entirely, keep it as-is (avoid nuking a
     page whose comment happens to resemble a header)."""
     if len(pages_text) < 2:
         return pages_text  # nothing repeats across a single page
 
-    # Count how many pages each normalised line appears on.
+    # Count how many pages each normalised line appears on, and remember the
+    # first page it was seen on (that copy is the one we keep).
     from collections import defaultdict
     page_count = defaultdict(int)
+    first_page = {}
     per_page_lines = []
-    for t in pages_text:
+    for pi, t in enumerate(pages_text):
         lines = t.split("\n")
         per_page_lines.append(lines)
         seen_here = set()
@@ -512,6 +616,8 @@ def dedupe_boilerplate(pages_text):
             if n and n not in seen_here:
                 seen_here.add(n)
                 page_count[n] += 1
+                if n not in first_page:
+                    first_page[n] = pi
 
     # A line is boilerplate if it shows up on >= 2 pages AND is short-ish
     # (real multi-page comment paragraphs are rare; headers/footers are short).
@@ -519,8 +625,13 @@ def dedupe_boilerplate(pages_text):
         return page_count.get(nline, 0) >= 2 and len(nline) <= 120
 
     cleaned_pages = []
-    for lines in per_page_lines:
-        kept = [ln for ln in lines if not is_boiler(_norm_line(ln))]
+    for pi, lines in enumerate(per_page_lines):
+        kept = []
+        for ln in lines:
+            n = _norm_line(ln)
+            if n and is_boiler(n) and first_page.get(n) != pi:
+                continue          # repeat copy -> drop; first copy is kept
+            kept.append(ln)
         # Safety net: never let dedupe empty a page completely.
         if not any(l.strip() for l in kept):
             kept = lines
@@ -529,7 +640,8 @@ def dedupe_boilerplate(pages_text):
 
 
 # Words/phrases that signal a page carries reviewer comments rather than
-# pure spec-sheet boilerplate. Used to prioritise pages if a doc is too long.
+# pure spec-sheet boilerplate. Used by cap_chunks to rank chunks if a doc is
+# pathologically long.
 COMMENT_SIGNALS = re.compile(
     r'\b(shall|should|to be|required|ensure|provide|verify|comply|complian'
     r'|approved|vendor|deviation|clarification|as per|not acceptable'
@@ -538,24 +650,17 @@ COMMENT_SIGNALS = re.compile(
 )
 
 
-def prioritise_pages(pages_text, char_budget=CHAR_BUDGET):
-    """Keep pages in DOCUMENT ORDER. Only drop lowest-signal pages if over budget."""
-    total = sum(len(t) for t in pages_text)
-    if total <= char_budget:
-        return "\n".join(pages_text)
-    scored = []
-    for i, t in enumerate(pages_text):
-        score = len(COMMENT_SIGNALS.findall(t))
-        scored.append((score, i, t))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    keep_idx, used = set(), 0
-    for score, i, t in scored:
-        if used + len(t) > char_budget:
-            continue
-        keep_idx.add(i)
-        used += len(t)
-    kept = [pages_text[i] for i in range(len(pages_text)) if i in keep_idx]
-    return "\n".join(kept)
+def cap_chunks(chunks, max_chunks=MAX_CHUNKS_PER_DOC):
+    """Last-resort guard for pathological documents: if even chunking would
+    mean an unreasonable number of API calls, keep the chunks with the most
+    comment-signal words (in document order). Only here can content ever be
+    dropped — normal documents always send everything."""
+    if len(chunks) <= max_chunks:
+        return chunks
+    ranked = sorted(range(len(chunks)),
+                    key=lambda i: -len(COMMENT_SIGNALS.findall(chunks[i])))
+    keep = sorted(ranked[:max_chunks])
+    return [chunks[i] for i in keep]
 
 
 def split_oversized(text, limit=MODEL_CHAR_LIMIT):
@@ -581,11 +686,32 @@ def split_oversized(text, limit=MODEL_CHAR_LIMIT):
 # COMMENT SPLITTER / CLEANERS  (unchanged behaviour)
 # ============================================================================
 def split_merged_comments(comments_list):
+    """Split blocks like '1) aaa 2) bbb 3) ccc' (or '1. aaa 2. bbb') into
+    separate comments. Only splits when a REAL numbered sequence is present:
+    at least two markers, starting at 1 or 2, strictly increasing. A lone
+    'n)' inside a sentence (clause references, '9-pin (SUB-D)', bore sizes)
+    no longer splits a comment in half, and decimals like '2.4' never match
+    because the marker requires whitespace after the separator."""
+    marker = re.compile(r'(?:(?<=\s)|^)(\d{1,2})[\.\)]\s+')
     result = []
     for comment in comments_list:
-        parts = re.split(r'(?:(?<=\s)|^)\d{1,2}\)\s+', comment)
-        parts = [p.strip(' .') for p in parts if p.strip(' .')]
-        if len(parts) > 1:
+        ms = list(marker.finditer(comment))
+        nums = [int(m.group(1)) for m in ms]
+        is_seq = (len(ms) >= 2 and nums[0] <= 2 and
+                  all(b > a for a, b in zip(nums, nums[1:])))
+        if not is_seq:
+            result.append(comment.strip())
+            continue
+        parts = []
+        pre = comment[:ms[0].start()].strip(' .')
+        if pre:
+            parts.append(pre)   # lead-in text; header filter handles it later
+        for i, m in enumerate(ms):
+            end = ms[i + 1].start() if i + 1 < len(ms) else len(comment)
+            seg = comment[m.end():end].strip(' .')
+            if seg:
+                parts.append(seg)
+        if parts:
             result.extend(parts)
         else:
             result.append(comment.strip())
@@ -594,7 +720,8 @@ def split_merged_comments(comments_list):
 
 HEADER_PATTERNS = re.compile(
     r'^(clarification|clarifications required|following points|following items'
-    r'|please incorporate|please note the following|comments?:?$)',
+    r'|please incorporate|please note the following|comments?:?$'
+    r'|insert text here\.?$)',
     re.I
 )
 
@@ -619,6 +746,20 @@ LEADIN = re.compile(
 
 def strip_leadin(text):
     return LEADIN.sub('', text).strip()
+
+
+def dedupe_comments(comments):
+    """Remove duplicate comments while preserving first-seen order. Chunked
+    requests and markups repeated across pages can yield the same comment
+    twice; the Excel should list it once."""
+    seen = set()
+    out = []
+    for c in comments:
+        k = re.sub(r'\W+', ' ', c).strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
 
 
 # ============================================================================
@@ -680,8 +821,10 @@ def _extract_content(fmt, data):
 
 
 async def _single_call(session, cfg, api_key, model, prompt):
-    """One HTTP attempt. Returns (content, error, status). Exactly one of
-    content/error is non-None. status is the HTTP code (or None on exception)."""
+    """One HTTP attempt. Returns (content, error, status, retry_after).
+    Exactly one of content/error is non-None. status is the HTTP code (or
+    None on exception); retry_after is the server's Retry-After seconds on
+    429/5xx when provided."""
     url = cfg["url"]
     fmt = cfg.get("format", "openai")
     headers, payload = _headers_and_payload(cfg, api_key, model, prompt)
@@ -689,18 +832,25 @@ async def _single_call(session, cfg, api_key, model, prompt):
         async with session.post(url, json=payload, headers=headers,
                                 timeout=REQUEST_TIMEOUT) as resp:
             status = resp.status
+            retry_after = None
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                try:
+                    retry_after = float(ra)
+                except ValueError:
+                    retry_after = None
             if status == 200:
                 data = await resp.json()
                 try:
-                    return _extract_content(fmt, data), None, status
+                    return _extract_content(fmt, data), None, status, None
                 except (KeyError, IndexError, TypeError) as e:
-                    return None, f"bad response shape: {str(e)[:60]}", status
+                    return None, f"bad response shape: {str(e)[:60]}", status, None
             txt = await resp.text()
-            return None, f"HTTP {status}: {txt[:160]}", status
+            return None, f"HTTP {status}: {txt[:160]}", status, retry_after
     except asyncio.TimeoutError:
-        return None, "timeout", None
+        return None, "timeout", None, None
     except Exception as e:
-        return None, str(e)[:100], None
+        return None, str(e)[:100], None, None
 
 
 async def call_with_key_pool(session, prompt, model, primary_provider,
@@ -717,8 +867,10 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
          - 429  -> mark ONLY that key on cooldown, immediately try next key
                    (requirement 3/4). Never hammer the same key.
          - 5xx/timeout -> short cooldown on that key, try next.
-         - 4xx (auth/bad) -> that key is broken; long cooldown so we stop using
-           it, move on to others.
+         - 401/403 -> the key is invalid; it is marked dead and NEVER
+           scheduled again (no retries on permanently bad keys).
+         - other 4xx (bad request / unknown model) -> long cooldown; the key
+           itself may be fine, so it isn't killed.
       4. Give up only after a bounded number of scheduling attempts with no
          success (avoids an infinite loop if all keys are permanently bad).
 
@@ -738,6 +890,8 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
         now = time.time()
         api_key, wait = key_pool.acquire(now)
         if api_key is None:
+            if key_pool.has_any():
+                return None, "all API keys are invalid (authentication failed)"
             return None, "no API keys configured"
 
         # Every key is cooling down -> wait for the soonest (requirement 6/7).
@@ -758,8 +912,8 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
         api_key.last_request_time = now
 
         t0 = time.time()
-        content, err, status = await _single_call(session, cfg, api_key.key,
-                                                  use_model, prompt)
+        content, err, status, retry_after = await _single_call(
+            session, cfg, api_key.key, use_model, prompt)
         latency = time.time() - t0
 
         analytics.record(
@@ -784,17 +938,24 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
         # Failure handling — per key.
         now = time.time()
         if status == 429:
-            api_key.mark_429(now)               # cooldown THIS key only
+            api_key.mark_429(now, retry_after)  # cooldown THIS key only,
             tried_notes.append(f"{api_key.label}:429")
             continue                            # immediately try next key
         elif status in RETRYABLE_STATUS or status is None:
             api_key.mark_other_failure(now)     # 5xx / timeout
             tried_notes.append(f"{api_key.label}:{status or 'net'}")
             continue
+        elif status in (401, 403):
+            # Invalid/revoked key: remove it from rotation permanently.
+            api_key.mark_dead()
+            tried_notes.append(f"{api_key.label}:{status}-dead")
+            if not key_pool.has_usable():
+                return None, "all API keys are invalid (authentication failed)"
+            continue
         else:
-            # Permanent (401/400/403): park this key on a long cooldown so the
-            # scheduler stops picking it, then move on to other keys.
-            api_key.cooldown_until = now + BACKOFF_CAP
+            # Other 4xx (bad request / unknown model): the KEY may be fine, so
+            # park it on a long cooldown instead of killing it, and move on.
+            api_key.cooldown_until = now + 120.0
             api_key.total_failures += 1
             tried_notes.append(f"{api_key.label}:{status}")
             continue
@@ -825,7 +986,14 @@ def _parse_comments(content):
             m = re.search(r'"comments"\s*:\s*\[(.*?)\]', content, re.S)
             if m:
                 items = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
-                parsed = {"comments": [i.encode().decode('unicode_escape') for i in items]}
+                def _unescape(s):
+                    # JSON-decode the escapes; unlike unicode_escape this
+                    # never mangles non-ASCII characters.
+                    try:
+                        return json.loads('"' + s + '"')
+                    except Exception:
+                        return s
+                parsed = {"comments": [_unescape(i) for i in items]}
         except Exception:
             parsed = None
 
@@ -851,17 +1019,21 @@ def _clean_comment_list(raw):
     return cleaned
 
 
-async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable,
+async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
                     api_choice, model, key_pool, analytics):
-    """Extract comments for one submittal. Splits oversized text, calls the
-    key-pool scheduler per chunk, merges results in order."""
-    sub_id = submittal_id_from_name(zip_name)
+    """Extract comments for one submittal (ZIP or standalone PDF). Splits
+    oversized text, calls the key-pool scheduler per chunk, merges results
+    in order."""
+    sub_id = submittal_id_from_name(file_name)
     base = {"submittal": sub_id, "document": doc_name, "unreadable": unreadable}
     if not pdf_text.strip():
         return {**base, "comments": [], "error": "No text in PDF"}
 
-    # Smart request management: keep each request under the model ceiling.
-    chunks = split_oversized(pdf_text, MODEL_CHAR_LIMIT)
+    # Nothing is dropped: an oversized document becomes MULTIPLE requests
+    # (each under the per-request budget) whose results are merged. Only a
+    # pathological document beyond MAX_CHUNKS_PER_DOC ever loses content.
+    chunks = split_oversized(pdf_text, min(CHAR_BUDGET, MODEL_CHAR_LIMIT))
+    chunks = cap_chunks(chunks)
 
     all_comments = []
     last_err = None
@@ -881,6 +1053,9 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable,
             continue
         all_comments.extend(_clean_comment_list(parsed))
 
+    # De-duplicate across chunks/pages while preserving order.
+    all_comments = dedupe_comments(all_comments)
+
     # If we got comments from at least one chunk, that's a success even if
     # another chunk failed (partial recovery beats total failure).
     if all_comments:
@@ -888,33 +1063,49 @@ async def _llm_only(session, zip_name, pdf_text, doc_name, unreadable,
     return {**base, "comments": [], "error": last_err or "no comments extracted"}
 
 
-async def _process_one(session, zip_name, zip_bytes, sem,
+async def _process_one(session, file_name, file_bytes, sem,
                        api_choice, model, key_pool, analytics):
-    """Extract text for ONE zip and call the LLM, under the semaphore so only
-    CONCURRENCY PDFs are in memory at once. Frees PDF bytes and gc's between.
-    One ZIP failing never stops the batch (exception is caught -> error row)."""
+    """Extract text for ONE upload (ZIP or standalone PDF) and call the LLM,
+    under the semaphore so only CONCURRENCY files are parsed at once. Frees
+    PDF bytes and gc's between. One file failing never stops the batch
+    (exception is caught -> error row)."""
     async with sem:
         try:
-            pages, unreadable, had_comment_file = extract_pdf_text(zip_bytes)
-            doc_name = extract_doc_name_from_zip(zip_bytes)
+            # A directly-uploaded PDF has no sibling files, so it is always
+            # treated as the comment-bearing document itself.
+            is_single_pdf = file_name.lower().endswith('.pdf')
+            pdf_items = _pdf_items_from_upload(file_name, file_bytes)
+            file_bytes = None
+            pages, page_annots, unreadable, had_comment_file = \
+                extract_pdf_text(pdf_items, treat_all_as_comments=is_single_pdf)
+            doc_name = extract_doc_name_from_items(pdf_items)
+            pdf_items = None
             if not had_comment_file:
                 # No annotated/response PDF -> genuinely no reviewer comments.
-                zip_bytes = None
-                res = {"submittal": submittal_id_from_name(zip_name),
+                res = {"submittal": submittal_id_from_name(file_name),
                        "document": doc_name, "unreadable": 0,
                        "comments": [], "error": None}
             else:
-                zip_bytes = None
-                # Token reduction: strip repeated boilerplate BEFORE prioritising.
+                # Token reduction: strip repeated boilerplate, then re-attach
+                # each page's annotation text (page order preserved;
+                # annotations are never subject to boilerplate removal).
                 pages = dedupe_boilerplate(pages)
-                text = prioritise_pages(pages)
-                pages = None
+                blocks = []
+                for i, ptxt in enumerate(pages):
+                    ann = page_annots[i] if i < len(page_annots) else []
+                    if ann:
+                        ptxt = (ptxt + "\n" + "\n".join(
+                            f"[Reviewer annotation] {t}" for t in ann)).strip()
+                    if ptxt.strip():
+                        blocks.append(ptxt)
+                text = "\n".join(blocks)
+                pages = page_annots = None
                 gc.collect()
-                res = await _llm_only(session, zip_name, text, doc_name,
+                res = await _llm_only(session, file_name, text, doc_name,
                                       unreadable, api_choice, model,
                                       key_pool, analytics)
         except Exception as e:
-            res = {"submittal": submittal_id_from_name(zip_name),
+            res = {"submittal": submittal_id_from_name(file_name),
                    "document": "", "unreadable": 0,
                    "comments": [], "error": f"Processing error: {str(e)[:60]}"}
         gc.collect()
@@ -927,9 +1118,9 @@ async def process_all(zip_files, api_choice, model,
     results = []
     async with aiohttp.ClientSession() as session:
         tasks = [
-            _process_one(session, zip_name, zip_bytes, sem,
+            _process_one(session, file_name, file_bytes, sem,
                          api_choice, model, key_pool, analytics)
-            for zip_name, zip_bytes in zip_files
+            for file_name, file_bytes in zip_files
         ]
         done = 0
         for coro in asyncio.as_completed(tasks):
@@ -1024,8 +1215,9 @@ def build_excel(results):
 # UI  (unchanged layout; adds optional fallback keys + analytics summary)
 # ============================================================================
 st.title("TPL Comment Extractor")
-st.caption("Upload submittal ZIPs. Comments are extracted by an LLM in parallel, "
-           "split into individual items, and written to the TPL Excel format.")
+st.caption("Upload submittal ZIPs or standalone PDFs. Comments are extracted "
+           "by an LLM in parallel, split into individual items, and written "
+           "to the TPL Excel format.")
 
 # API selection — in the main page so it's always visible (mobile-friendly)
 st.subheader("1. Choose API")
@@ -1118,19 +1310,20 @@ if total_keys == 0:
 # Make sure the primary provider actually has keys; if not, fall back to
 # whichever provider does (so the user isn't forced to match the dropdown).
 if not provider_key_lists.get(api_choice):
+    wanted = api_choice
     for prov in POOL_PROVIDERS:
         if provider_key_lists.get(prov):
             api_choice = prov
             model = SUPPORTED_APIS[prov]["models"][0]
-            st.info(f"No {api_choice.upper()} keys entered for the selected "
+            st.info(f"No {wanted.upper()} keys entered for the selected "
                     f"primary; using {prov.upper()} as primary instead.")
             break
 
-uploaded = st.file_uploader("Upload ZIP files", type="zip",
+uploaded = st.file_uploader("Upload ZIP or PDF files", type=["zip", "pdf"],
                             accept_multiple_files=True)
 
 if uploaded:
-    st.info(f"{len(uploaded)} ZIP file(s) ready. {total_keys} key(s) in pool.")
+    st.info(f"{len(uploaded)} file(s) ready. {total_keys} key(s) in pool.")
     if st.button("Extract Comments"):
         zip_files = [(f.name, f.read()) for f in uploaded]
 
