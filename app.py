@@ -341,6 +341,213 @@ def est_tokens(text):
 
 
 # ============================================================================
+# DEBUG MODE — purely diagnostic pipeline tracing (never changes extraction)
+# ============================================================================
+# When "Enable Debug Mode" is ticked in the UI, every submittal writes a full
+# pipeline trace to debug_logs/<SUBMITTAL>/ as numbered text files: which PDFs
+# were selected and why, per-page extracted text, every annotation seen, the
+# exact prompts sent, the raw LLM responses, the cleaned comments with a
+# best-effort source attribution (page + annotation/page-text), the Excel rows
+# and a summary. Every hook below is a no-op when trace is None, so disabled
+# mode behaves exactly as before.
+
+DEBUG_DIR = "debug_logs"
+
+
+class DebugTrace:
+    """Collects one submittal's pipeline artifacts; save() writes the files."""
+
+    def __init__(self, sub_id):
+        self.sub_id = sub_id
+        self.selected = []     # [{pdf, reason}]
+        self.skipped = []      # pdf names not selected as comment-bearing
+        self.notes = []        # free-form diagnostics (read failures etc.)
+        self.pages = []        # [{pdf, page, text, ocr_used, annots, included}]
+        self.annotations = []  # [{pdf, page, subtype, text, kept, note}]
+        self.prompts = []      # exact prompt string per chunk
+        self.responses = []    # [{chunk, content, error, parse_error}]
+        self.chunks = 0
+
+    def note_selected(self, pdf, reason):
+        self.selected.append({"pdf": pdf, "reason": reason})
+
+    def _attribute(self, comment):
+        """Best-effort source attribution for a CLEANED comment: find the page
+        whose annotation (checked first — most comments are markups) or text
+        layer contains it. Tries the full normalised comment, then shrinking
+        prefixes, because the cleaning pipeline may have split or trimmed what
+        the LLM returned. Diagnostic only — never affects extraction."""
+        c = re.sub(r'\W+', ' ', comment).strip().lower()
+        for key in (c, c[:80], c[:40]):
+            if len(key) < 15:
+                continue
+            for a in self.annotations:
+                if not a.get("kept"):
+                    continue
+                an = re.sub(r'\W+', ' ', a.get("text", "")).strip().lower()
+                if not an:
+                    continue
+                if key in an or (len(an) >= 15 and an in c):
+                    return a["pdf"], a["page"], "annotation"
+            for p in self.pages:
+                pn = re.sub(r'\W+', ' ', p["text"]).strip().lower()
+                if key in pn:
+                    return p["pdf"], p["page"], "page text"
+        return None, None, ("not located verbatim (LLM likely paraphrased "
+                            "or merged source text)")
+
+    def save(self, base_dir, result, analytics):
+        safe = re.sub(r'[^A-Za-z0-9._-]+', '_', self.sub_id) or "submittal"
+        d = os.path.join(base_dir, safe)
+        os.makedirs(d, exist_ok=True)
+
+        def w(fname, text):
+            with open(os.path.join(d, fname), "w", encoding="utf-8",
+                      errors="replace") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
+
+        # -- 01: which PDFs were selected as comment-bearing, and why --------
+        lines = [f"Submittal: {self.sub_id}", ""]
+        if self.selected:
+            lines.append("Selected comment-bearing PDF(s):")
+            for s in self.selected:
+                lines.append(f"  - {s['pdf']}")
+                lines.append(f"    reason: {s['reason']}")
+        else:
+            lines.append("No comment-bearing PDF selected -> submittal "
+                         "treated as having no reviewer comments.")
+        if self.skipped:
+            lines += ["", "Skipped PDF(s) (no comment keyword in filename, "
+                          "no sentence-like reviewer annotations):"]
+            lines += [f"  - {n}" for n in self.skipped]
+        if self.notes:
+            lines += ["", "Notes:"] + [f"  - {n}" for n in self.notes]
+        w("01_selected_pdf.txt", "\n".join(lines))
+
+        # -- 02: raw per-page extracted text ---------------------------------
+        parts = ["Raw per-page text as extracted (after OCR fallback, BEFORE "
+                 "boilerplate dedupe / chunking).", ""]
+        for p in self.pages:
+            parts.append(f"{'=' * 22} {p['pdf']} — page {p['page']} {'=' * 22}")
+            parts.append(f"[OCR used: {'yes' if p['ocr_used'] else 'no'}] "
+                         f"[included in pipeline: "
+                         f"{'yes' if p['included'] else 'no (empty page)'}]")
+            parts.append(p["text"].strip() or "<no extractable text>")
+            parts.append("")
+        if not self.pages:
+            parts.append("No pages extracted.")
+        w("02_extracted_text.txt", "\n".join(parts))
+
+        # -- 03: every annotation seen, with page + subtype ------------------
+        parts = []
+        for a in self.annotations:
+            parts.append(f"{a['pdf']} — page {a['page']}")
+            parts.append(f"  subtype: {a['subtype'] or '(none)'}")
+            kept = "yes" if a["kept"] else f"no ({a['note']})"
+            parts.append(f"  kept:    {kept}")
+            parts.append(f"  text:    {a['text'] or '<empty>'}")
+            parts.append("")
+        w("03_annotations.txt",
+          "\n".join(parts) if self.annotations else "No annotations found.")
+
+        # -- 04: exact prompt(s) sent to the LLM -----------------------------
+        parts = []
+        for i, pr in enumerate(self.prompts, 1):
+            parts.append(f"{'=' * 20} prompt — chunk {i}/{len(self.prompts)} "
+                         f"{'=' * 20}")
+            parts.append(pr)
+            parts.append("")
+        w("04_prompt.txt",
+          "\n".join(parts) if self.prompts
+          else "No prompt sent (no text or no comment-bearing PDF).")
+
+        # -- 05: raw LLM response(s) before parsing --------------------------
+        parts = []
+        for r in self.responses:
+            parts.append(f"{'=' * 20} response — chunk {r['chunk']} {'=' * 20}")
+            if r["error"]:
+                parts.append(f"[request error: {r['error']}]")
+            parts.append(r["content"] if r["content"] is not None
+                         else "<no content>")
+            if r.get("parse_error"):
+                parts.append(f"[parse error: {r['parse_error']}]")
+            parts.append("")
+        w("05_llm_response.txt",
+          "\n".join(parts) if self.responses else "No LLM call was made.")
+
+        # -- 06: cleaned comments with source page attribution ---------------
+        parts = []
+        for i, c in enumerate(result.get("comments", []), 1):
+            pdf, page, src = self._attribute(c)
+            parts.append(f"--- Comment {i} ---")
+            parts.append(f"Page {page}  ({pdf})" if page is not None
+                         else "Page: not located")
+            parts += ["", "Comment:", c, "", "Source:", src, ""]
+        w("06_cleaned_comments.txt",
+          "\n".join(parts) if result.get("comments")
+          else "No comments extracted."
+             + (f"\nError: {result['error']}" if result.get("error") else ""))
+
+        # -- 07: the Excel rows this submittal produces ----------------------
+        comments = result.get("comments", [])
+        unread = result.get("unreadable", 0)
+        note = (f"{unread} page(s) could not be read as text (possible "
+                f"scanned comments) — check PDF manually") if unread else ""
+        rows = ["Columns: Sr no. | Submittal | Document | Costumer Comments "
+                "| Xylem Remarks | Review Note",
+                "(Sr no. is assigned globally when the workbook is built; "
+                "shown as '-')", ""]
+        if comments:
+            for k, cm in enumerate(comments, 1):
+                rows.append(" | ".join([
+                    "-" if k == 1 else "",
+                    self.sub_id if k == 1 else "",
+                    (result.get("document", "") or "") if k == 1 else "",
+                    f"{k}. {cm}",
+                    "",
+                    note if k == 1 else ""]))
+        else:
+            rows.append(" | ".join(["-", self.sub_id,
+                                    result.get("document", "") or "",
+                                    "", "Comment not Received", note]))
+        w("07_excel_rows.txt", "\n".join(rows))
+
+        # -- 08: summary ------------------------------------------------------
+        my = [r for r in analytics.rows if r.get("submittal") == self.sub_id]
+        sizes = [r.get("chars_sent", 0) for r in my]
+        lats = [r.get("latency", 0.0) for r in my]
+        failed = sum(1 for r in my if r.get("status") != 200)
+        lines = [
+            f"Submittal:          {self.sub_id}",
+            f"Document:           {result.get('document', '')}",
+            f"Total pages:        {len(self.pages)}",
+            f"OCR pages:          "
+            f"{sum(1 for p in self.pages if p['ocr_used'])}",
+            f"Annotation pages:   "
+            f"{sum(1 for p in self.pages if p['annots'])}",
+            f"Unreadable pages:   {unread}",
+            f"Chunks:             {self.chunks}",
+            f"API calls:          {len(my)}",
+            f"Provider(s) used:   "
+            f"{', '.join(sorted({r['provider'] for r in my})) or '-'}",
+            f"Model(s):           "
+            f"{', '.join(sorted({r['model'] for r in my})) or '-'}",
+            f"Key(s):             "
+            f"{', '.join(sorted({r['key_label'] for r in my})) or '-'}",
+            f"Request size:       avg {round(sum(sizes) / len(sizes)) if sizes else 0} chars, "
+            f"max {max(sizes) if sizes else 0} chars",
+            f"Latency:            total {round(sum(lats), 2)}s, "
+            f"avg {round(sum(lats) / len(lats), 2) if lats else 0}s",
+            f"Retries (failed attempts): {failed}",
+            f"429 responses:      "
+            f"{sum(1 for r in my if r.get('status') == 429)}",
+            f"Comments extracted: {len(comments)}",
+            f"Error:              {result.get('error') or '-'}",
+        ]
+        w("08_summary.txt", "\n".join(lines))
+
+
+# ============================================================================
 # PDF / ZIP HELPERS
 # ============================================================================
 def submittal_id_from_name(file_name):
@@ -364,12 +571,16 @@ def _pdf_items_from_upload(file_name, file_bytes):
     return items
 
 
-def _read_page_annotations(page):
+def _read_page_annotations(page, collect=None):
     """Reviewer markups saved as live annotation objects (FreeText callouts,
     notes) never appear in extract_text() — their text lives in the
     annotation's /Contents. Read it directly. Link/Popup/Widget annotations
     are navigation chrome, not comments; stamps/shapes without text are
-    skipped automatically because their /Contents is empty."""
+    skipped automatically because their /Contents is empty.
+
+    `collect` (Debug Mode only): when a list is supplied, every annotation
+    object seen is appended as {subtype, text, kept, note}, including the
+    skipped ones. Never changes what is returned."""
     texts = []
     try:
         annots = page.annots or []
@@ -381,6 +592,10 @@ def _read_page_annotations(page):
             sub = data.get("Subtype")
             sub_name = getattr(sub, "name", "") or (str(sub) if sub else "")
             if sub_name in ("Link", "Popup", "Widget"):
+                if collect is not None:
+                    collect.append({"subtype": sub_name, "text": "",
+                                    "kept": False,
+                                    "note": "navigation chrome — skipped"})
                 continue
             raw = a.get("contents")
             if raw is None:
@@ -393,6 +608,13 @@ def _read_page_annotations(page):
             txt = re.sub(r'\s+', ' ', str(raw)).strip() if raw else ""
             if txt:
                 texts.append(txt)
+                if collect is not None:
+                    collect.append({"subtype": sub_name, "text": txt,
+                                    "kept": True, "note": ""})
+            elif collect is not None:
+                collect.append({"subtype": sub_name, "text": "",
+                                "kept": False,
+                                "note": "empty /Contents — skipped"})
         except Exception:
             continue
     return texts
@@ -432,7 +654,7 @@ def _has_reviewer_annotations(raw):
     return False
 
 
-def extract_pdf_text(pdf_items, treat_all_as_comments=False):
+def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None):
     """Pull text from the COMMENT-bearing PDFs using pdfplumber.
 
     Reviewer comments live only in an annotated markup PDF or a reviewer
@@ -456,17 +678,35 @@ def extract_pdf_text(pdf_items, treat_all_as_comments=False):
 
     Returns (pages_text, pages_annots, unreadable_pages, had_comment_file);
     pages_text[i] and pages_annots[i] describe the same page, in order.
+
+    `trace` (Debug Mode only) records selection reasons, per-page text and
+    annotations. All trace hooks are no-ops when trace is None.
     """
     pages_text = []
     pages_annots = []
     unreadable_pages = 0
     if treat_all_as_comments:
         comment_pdfs = list(pdf_items)
+        if trace is not None:
+            for n, _ in pdf_items:
+                trace.note_selected(n, "direct PDF upload — no sibling files, "
+                                       "treated as comment-bearing")
     else:
         chosen = {n for n, _ in pdf_items if _name_says_comments(n)}
+        if trace is not None:
+            for n in sorted(chosen):
+                kw = next((k for k in COMMENT_NAME_KEYWORDS
+                           if k in n.lower()), "?")
+                trace.note_selected(
+                    n, f"filename contains comment keyword '{kw}'")
         for n, b in pdf_items:
             if n not in chosen and _has_reviewer_annotations(b):
                 chosen.add(n)
+                if trace is not None:
+                    trace.note_selected(n, "content carries sentence-like "
+                                           "reviewer annotations")
+        if trace is not None:
+            trace.skipped = [n for n, _ in pdf_items if n not in chosen]
         # keep original archive order so comment order is stable
         comment_pdfs = [(n, b) for n, b in pdf_items if n in chosen]
         if not comment_pdfs:
@@ -474,7 +714,7 @@ def extract_pdf_text(pdf_items, treat_all_as_comments=False):
     for name, raw in comment_pdfs:
         try:
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                for page in pdf.pages:
+                for page_no, page in enumerate(pdf.pages, 1):
                     t = page.extract_text() or ""
                     has_images = False
                     try:
@@ -483,30 +723,53 @@ def extract_pdf_text(pdf_items, treat_all_as_comments=False):
                         pass
 
                     # OCR fallback: page has images but no real text
+                    ocr_used = False
                     if len(t.strip()) < 50 and has_images and OCR_AVAILABLE:
                         try:
                             img = page.to_image()
                             ocr_text = pytesseract.image_to_string(img.original)
                             if len(ocr_text.strip()) > len(t.strip()):
                                 t = ocr_text
+                                ocr_used = True
                         except Exception:
                             pass
 
-                    annot_texts = _read_page_annotations(page)
+                    collect = [] if trace is not None else None
+                    annot_texts = _read_page_annotations(page, collect)
                     # Avoid duplicates: skip annotation text that is already
                     # flattened into this page's text layer.
                     if annot_texts:
                         page_norm = re.sub(r'\s+', ' ', t).lower()
-                        annot_texts = [x for x in annot_texts
-                                       if x[:60].lower() not in page_norm]
+                        kept_texts = [x for x in annot_texts
+                                      if x[:60].lower() not in page_norm]
+                        if collect:
+                            for entry in collect:
+                                if entry["kept"] and \
+                                        entry["text"] not in kept_texts:
+                                    entry["kept"] = False
+                                    entry["note"] = ("text already flattened "
+                                                     "into page text — deduped")
+                        annot_texts = kept_texts
+
+                    if trace is not None:
+                        trace.pages.append({
+                            "pdf": name, "page": page_no, "text": t,
+                            "ocr_used": ocr_used,
+                            "annots": list(annot_texts),
+                            "included": bool(t.strip() or annot_texts),
+                        })
+                        for entry in (collect or []):
+                            trace.annotations.append(
+                                {"pdf": name, "page": page_no, **entry})
 
                     if t.strip() or annot_texts:
                         pages_text.append(t)
                         pages_annots.append(annot_texts)
                     if len(t.strip()) < 50 and has_images:
                         unreadable_pages += 1
-        except Exception:
-            pass
+        except Exception as e:
+            if trace is not None:
+                trace.notes.append(f"failed to read {name}: {str(e)[:80]}")
     return pages_text, pages_annots, unreadable_pages, True
 
 
@@ -1128,10 +1391,10 @@ def _clean_comment_list(raw):
 
 
 async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
-                    api_choice, model, key_pool, analytics):
+                    api_choice, model, key_pool, analytics, trace=None):
     """Extract comments for one submittal (ZIP or standalone PDF). Splits
     oversized text, calls the key-pool scheduler per chunk, merges results
-    in order."""
+    in order. `trace` (Debug Mode) records prompts and raw responses."""
     sub_id = submittal_id_from_name(file_name)
     base = {"submittal": sub_id, "document": doc_name, "unreadable": unreadable}
     if not pdf_text.strip():
@@ -1142,14 +1405,21 @@ async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
     # pathological document beyond MAX_CHUNKS_PER_DOC ever loses content.
     chunks = split_oversized(pdf_text, min(CHAR_BUDGET, MODEL_CHAR_LIMIT))
     chunks = cap_chunks(chunks)
+    if trace is not None:
+        trace.chunks = len(chunks)
 
     all_comments = []
     last_err = None
-    for chunk in chunks:
+    for ci, chunk in enumerate(chunks, 1):
         prompt = PROMPT_TEMPLATE.format(body=chunk)
+        if trace is not None:
+            trace.prompts.append(prompt)
         content, err = await call_with_key_pool(
             session, prompt, model, api_choice, key_pool, analytics, sub_id
         )
+        if trace is not None:
+            trace.responses.append({"chunk": ci, "content": content,
+                                    "error": err, "parse_error": None})
         if err or content is None:
             last_err = err or "no content"
             print(f"DEBUG {sub_id}: {last_err}")
@@ -1157,6 +1427,8 @@ async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
         parsed, _raw = _parse_comments(content)
         if parsed is None:
             last_err = f"No JSON in response (got: {(_raw or '')[:40]})"
+            if trace is not None:
+                trace.responses[-1]["parse_error"] = last_err
             print(f"DEBUG {sub_id}: {last_err}")
             continue
         all_comments.extend(_clean_comment_list(parsed))
@@ -1172,12 +1444,15 @@ async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
 
 
 async def _process_one(session, file_name, file_bytes, sem,
-                       api_choice, model, key_pool, analytics):
+                       api_choice, model, key_pool, analytics, debug_dir=None):
     """Extract text for ONE upload (ZIP or standalone PDF) and call the LLM,
     under the semaphore so only CONCURRENCY files are parsed at once. Frees
     PDF bytes and gc's between. One file failing never stops the batch
-    (exception is caught -> error row)."""
+    (exception is caught -> error row). `debug_dir` (Debug Mode) writes the
+    full pipeline trace to debug_dir/<SUBMITTAL>/ — diagnostics only."""
     async with sem:
+        trace = DebugTrace(submittal_id_from_name(file_name)) \
+            if debug_dir else None
         try:
             # A directly-uploaded PDF has no sibling files, so it is always
             # treated as the comment-bearing document itself.
@@ -1185,7 +1460,8 @@ async def _process_one(session, file_name, file_bytes, sem,
             pdf_items = _pdf_items_from_upload(file_name, file_bytes)
             file_bytes = None
             pages, page_annots, unreadable, had_comment_file = \
-                extract_pdf_text(pdf_items, treat_all_as_comments=is_single_pdf)
+                extract_pdf_text(pdf_items, treat_all_as_comments=is_single_pdf,
+                                 trace=trace)
             doc_name = extract_doc_name_from_items(pdf_items)
             pdf_items = None
             if not had_comment_file:
@@ -1211,23 +1487,34 @@ async def _process_one(session, file_name, file_bytes, sem,
                 gc.collect()
                 res = await _llm_only(session, file_name, text, doc_name,
                                       unreadable, api_choice, model,
-                                      key_pool, analytics)
+                                      key_pool, analytics, trace=trace)
         except Exception as e:
+            if trace is not None:
+                trace.notes.append(f"processing exception: {str(e)[:80]}")
             res = {"submittal": submittal_id_from_name(file_name),
                    "document": "", "unreadable": 0,
                    "comments": [], "error": f"Processing error: {str(e)[:60]}"}
+        if trace is not None:
+            # Debug Mode must never break processing: trace write failures are
+            # reported to the console and otherwise ignored.
+            try:
+                trace.save(debug_dir, res, analytics)
+            except Exception as e:
+                print(f"DEBUG-MODE: could not write trace for "
+                      f"{trace.sub_id}: {e}")
         gc.collect()
         return res
 
 
 async def process_all(zip_files, api_choice, model,
-                      key_pool, analytics, progress_cb=None):
+                      key_pool, analytics, progress_cb=None, debug_dir=None):
     sem = asyncio.Semaphore(CONCURRENCY)
     results = []
     async with aiohttp.ClientSession() as session:
         tasks = [
             _process_one(session, file_name, file_bytes, sem,
-                         api_choice, model, key_pool, analytics)
+                         api_choice, model, key_pool, analytics,
+                         debug_dir=debug_dir)
             for file_name, file_bytes in zip_files
         ]
         done = 0
@@ -1429,6 +1716,15 @@ if not provider_key_lists.get(api_choice):
                     f"primary; using {prov.upper()} as primary instead.")
             break
 
+debug_mode = st.checkbox(
+    "Enable Debug Mode",
+    value=False,
+    help="Diagnostics only — extraction behaviour is unchanged. Writes a full "
+         "pipeline trace for every submittal to debug_logs/<SUBMITTAL>/: "
+         "selected PDFs + reasons, per-page extracted text, annotations, the "
+         "exact prompts, raw LLM responses, cleaned comments with source "
+         "pages, Excel rows and a summary.")
+
 uploaded = st.file_uploader("Upload ZIP or PDF files", type=["zip", "pdf"],
                             accept_multiple_files=True)
 
@@ -1450,8 +1746,9 @@ if uploaded:
             status.text(f"Processed {done}/{total} submittals...")
 
         status.text(f"Sending to {api_choice.upper()} (pool of {total_keys} keys)...")
-        results = asyncio.run(process_all(zip_files, api_choice, model,
-                                          key_pool, analytics, cb))
+        results = asyncio.run(process_all(
+            zip_files, api_choice, model, key_pool, analytics, cb,
+            debug_dir=(DEBUG_DIR if debug_mode else None)))
         status.text("Building Excel...")
 
         wb = build_excel(results)
@@ -1464,6 +1761,10 @@ if uploaded:
         wall_seconds = time.time() - wall_start
 
         st.success("Done.")
+        if debug_mode:
+            st.info(f"Debug Mode: pipeline traces written to "
+                    f"`{os.path.abspath(DEBUG_DIR)}` "
+                    f"(one folder per submittal).")
         st.download_button(
             "Download TPL_Comments.xlsx",
             data=data,
