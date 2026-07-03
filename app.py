@@ -1345,17 +1345,19 @@ if custom_model.strip():
     model = custom_model.strip()
 
 # ---------------------------------------------------------------------------
-# PROVIDER POOL UI — add/remove multiple keys per provider (Gemini + Groq +
-# Kimi). Keys live in st.session_state so the +/- buttons persist across reruns.
+# PROVIDER POOL UI — add/remove multiple keys per provider. Every provider in
+# SUPPORTED_APIS automatically gets its own key section (nothing hard-coded).
+# Keys live in st.session_state so the +/- buttons persist across reruns.
 # Backward compatible: enter one Gemini + one Groq key and it behaves as before.
 # ---------------------------------------------------------------------------
 st.subheader("2. API Key Pool")
 st.caption("Add multiple keys per provider. During processing the app rotates "
            "through them: a key that hits a rate limit (429) is put on cooldown "
-           "and the next available key is used immediately. Gemini keys are "
-           "preferred, then Groq, then Kimi.")
+           "and the next available key is used immediately. Scheduling priority: "
+           + " → ".join(PROVIDER_PRIORITY)
+           + ", then any other provider with keys.")
 
-POOL_PROVIDERS = ["gemini", "groq", "kimi"]
+POOL_PROVIDERS = list(SUPPORTED_APIS.keys())
 
 # initialise session state: one empty slot per provider on first load
 for prov in POOL_PROVIDERS:
@@ -1412,7 +1414,7 @@ st.divider()
 st.subheader("3. Upload & Extract")
 
 if total_keys == 0:
-    st.warning("Add at least one Gemini, Groq or Kimi API key above to begin.")
+    st.warning("Add at least one API key above (any provider) to begin.")
     st.stop()
 
 # Make sure the primary provider actually has keys; if not, fall back to
