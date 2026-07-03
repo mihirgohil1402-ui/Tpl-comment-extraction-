@@ -90,6 +90,11 @@ SUPPORTED_APIS = {
         "format": "openai",
         "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
     },
+    "kimi": {
+        "url": "https://api.moonshot.ai/v1/chat/completions",
+        "format": "openai",
+        "models": ["kimi-k2.6", "kimi-k2.5", "kimi-latest"],
+    },
     "mistral": {
         "url": "https://api.mistral.ai/v1/chat/completions",
         "format": "openai",
@@ -122,14 +127,14 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # key across every provider is cooling down do we wait for the soonest one.
 #
 # Scheduling priority (as specified):
-#   available Gemini keys -> available Groq keys ->
-#   cooled-down Gemini keys -> cooled-down Groq keys
+#   available Gemini keys -> available Groq keys -> available Kimi keys ->
+#   cooled-down Gemini keys -> cooled-down Groq keys -> cooled-down Kimi keys
 # "available" = no active cooldown. Within a provider, keys are tried in the
 # order the user entered them (round-robin so load spreads across a provider).
 
 # Provider priority order for scheduling. Providers not listed here still work
 # (they fall in after these, in dict order), keeping the abstraction general.
-PROVIDER_PRIORITY = ["gemini", "groq"]
+PROVIDER_PRIORITY = ["gemini", "groq", "kimi"]
 
 
 class ApiKey:
@@ -1340,17 +1345,17 @@ if custom_model.strip():
     model = custom_model.strip()
 
 # ---------------------------------------------------------------------------
-# PROVIDER POOL UI — add/remove multiple keys per provider (Gemini + Groq).
-# Keys live in st.session_state so the +/- buttons persist across reruns.
+# PROVIDER POOL UI — add/remove multiple keys per provider (Gemini + Groq +
+# Kimi). Keys live in st.session_state so the +/- buttons persist across reruns.
 # Backward compatible: enter one Gemini + one Groq key and it behaves as before.
 # ---------------------------------------------------------------------------
 st.subheader("2. API Key Pool")
 st.caption("Add multiple keys per provider. During processing the app rotates "
            "through them: a key that hits a rate limit (429) is put on cooldown "
            "and the next available key is used immediately. Gemini keys are "
-           "preferred, then Groq.")
+           "preferred, then Groq, then Kimi.")
 
-POOL_PROVIDERS = ["gemini", "groq"]
+POOL_PROVIDERS = ["gemini", "groq", "kimi"]
 
 # initialise session state: one empty slot per provider on first load
 for prov in POOL_PROVIDERS:
@@ -1407,7 +1412,7 @@ st.divider()
 st.subheader("3. Upload & Extract")
 
 if total_keys == 0:
-    st.warning("Add at least one Gemini or Groq API key above to begin.")
+    st.warning("Add at least one Gemini, Groq or Kimi API key above to begin.")
     st.stop()
 
 # Make sure the primary provider actually has keys; if not, fall back to
