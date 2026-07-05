@@ -654,6 +654,72 @@ def _has_reviewer_annotations(raw):
     return False
 
 
+def _vendor_reference_text(pdf_items):
+    """Normalised text of every UNMARKED base twin PDF in the upload.
+
+    Vendor GA drawings carry their own notes blocks ('THE DRAWING SHALL BE
+    USED FOR REFERENCE ONLY...', 'SKID SHOULD BE PROPERLY GROUTED.') whose
+    imperative wording weaker models mistake for reviewer comments. Those
+    lines exist verbatim in the unannotated base PDF shipped in the same
+    ZIP; reviewer additions by definition do not. Extracted comments that
+    are textually contained in the twin are therefore vendor content and
+    can be removed deterministically AFTER the LLM step — the model input
+    stays byte-identical, so recall of genuine comments is unaffected.
+
+    Returns a single space-padded normalised string ('' when no twin)."""
+    def canon(pdf_name):
+        # names are equal modulo the 'annotated' token and trailing
+        # separators before .pdf (some archives truncate long names, leaving
+        # e.g. '...A-B-C-D-_annotated.pdf' next to '...A-B-C-D-.pdf')
+        n = pdf_name.lower()
+        n = re.sub(r'[\s_-]*annotated', '', n)
+        return re.sub(r'[\s_-]+(?=\.pdf$)', '', n)
+
+    chunks = []
+    for name, _ in pdf_items:
+        if 'annotated' not in name.lower():
+            continue
+        for n2, b2 in pdf_items:
+            if n2 == name or 'annotated' in n2.lower() \
+                    or canon(n2) != canon(name):
+                continue
+            try:
+                with pdfplumber.open(io.BytesIO(b2)) as pdf:
+                    for p in pdf.pages:
+                        chunks.append(p.extract_text() or "")
+            except Exception:
+                pass
+    if not chunks:
+        return ""
+    blob = re.sub(r'[^a-z0-9]+', ' ', " ".join(chunks).lower()).strip()
+    return f" {blob} " if blob else ""
+
+
+def _is_vendor_comment(comment, vendor_blob):
+    """Is this cleaned LLM comment vendor content from the base document?
+
+    Long comments are matched by 5-word shingles — the LLM stitches lines
+    that PDF extraction wrapped/interleaved (drawing tables run through the
+    notes column), so exact substring matching fails; >=80% of shingles
+    found in the twin means the comment is vendor text. Calibrated on the
+    corpus: vendor notes score 0.84-1.00, genuine reviewer comments score
+    0.00, and a pathological extraction line mixing a vendor table row with
+    a comment fragment scores 0.71 — safely below the threshold. Short
+    comments (< 5 words, e.g. a genuine 'Not accetable') must match
+    exactly, so a terse reviewer verdict is never mistaken for vendor
+    content."""
+    if not vendor_blob:
+        return False
+    words = re.sub(r'[^a-z0-9]+', ' ', comment.lower()).split()
+    if not words:
+        return False
+    if len(words) < 5:
+        return f" {' '.join(words)} " in vendor_blob
+    shingles = [' '.join(words[i:i + 5]) for i in range(len(words) - 4)]
+    hits = sum(1 for s in shingles if s in vendor_blob)
+    return hits / len(shingles) >= 0.8
+
+
 def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None):
     """Pull text from the COMMENT-bearing PDFs using pdfplumber.
 
@@ -1463,6 +1529,10 @@ async def _process_one(session, file_name, file_bytes, sem,
                 extract_pdf_text(pdf_items, treat_all_as_comments=is_single_pdf,
                                  trace=trace)
             doc_name = extract_doc_name_from_items(pdf_items)
+            # Vendor text of the unannotated base twin (if the upload has
+            # one): used AFTER the LLM step to drop comments that are really
+            # the vendor's own drawing notes, not reviewer additions.
+            vendor_blob = "" if is_single_pdf else _vendor_reference_text(pdf_items)
             pdf_items = None
             if not had_comment_file:
                 # No annotated/response PDF -> genuinely no reviewer comments.
@@ -1488,6 +1558,22 @@ async def _process_one(session, file_name, file_bytes, sem,
                 res = await _llm_only(session, file_name, text, doc_name,
                                       unreadable, api_choice, model,
                                       key_pool, analytics, trace=trace)
+                # Deterministic vendor filter: drop extracted "comments" that
+                # are textually contained in the unannotated base twin —
+                # vendor drawing notes, never reviewer additions. The model
+                # input was untouched, so genuine-comment recall is exactly
+                # what the model already delivered.
+                if vendor_blob and res.get("comments"):
+                    kept = []
+                    for c in res["comments"]:
+                        if _is_vendor_comment(c, vendor_blob):
+                            if trace is not None:
+                                trace.notes.append(
+                                    f"vendor comment removed (matches base "
+                                    f"twin): {c[:90]}")
+                        else:
+                            kept.append(c)
+                    res["comments"] = kept
         except Exception as e:
             if trace is not None:
                 trace.notes.append(f"processing exception: {str(e)[:80]}")
