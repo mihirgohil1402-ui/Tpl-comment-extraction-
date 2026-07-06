@@ -1175,10 +1175,12 @@ def split_merged_comments(comments_list):
     return result
 
 
+# Note: "Insert text here" (an empty markup callout) is deliberately NOT
+# filtered — the ground-truth Excel lists it as a comment (it flags an
+# empty callout the vendor must chase up).
 HEADER_PATTERNS = re.compile(
     r'^(clarification|clarifications required|following points|following items'
-    r'|please incorporate|please note the following|comments?:?$'
-    r'|insert text here\.?$)',
+    r'|please incorporate|please note the following|comments?:?$)',
     re.I
 )
 
