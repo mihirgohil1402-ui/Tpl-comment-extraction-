@@ -1156,6 +1156,8 @@ STRICT RULES:
 - If several requirements are written together (numbered 1) 2) 3) OR just run together in a block), SPLIT them into separate items. Never combine two different requirements into one item.
 - Do NOT include section headers or lead-ins such as "Clarifications required for the following points", "Following items to be mentioned", "Please incorporate following detail". Skip those; only output the actual items under them.
 - Do NOT include document body text, specifications tables, titles, or boilerplate. Only the reviewer's added comments.
+- The submittal usually embeds manufacturer installation manuals, equipment manuals, vendor instructions, drawing GENERAL NOTES, and specification body text. These are part of the document BEING reviewed, not reviewer comments - do NOT extract them unless the reviewer explicitly wrote them as a markup.
+- DO extract reviewer-written contractual requirements, compliance remarks, and instructions (e.g. "Vendor submissions are required to comply, at a minimum, with ... specifications", "Compliance to be ensured wrt ... specs"). These ARE reviewer comments even when they sound like specification language.
 - Keep each comment's wording complete and faithful. Do not summarise or shorten.
 - Output ONLY valid JSON, no commentary, in exactly this form:
 {{"comments": ["first comment", "second comment", "third comment"]}}
