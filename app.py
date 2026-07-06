@@ -704,20 +704,40 @@ def _is_vendor_comment(comment, vendor_blob):
     found in the twin means the comment is vendor text. Calibrated on the
     corpus: vendor notes score 0.84-1.00, genuine reviewer comments score
     0.00, and a pathological extraction line mixing a vendor table row with
-    a comment fragment scores 0.71 — safely below the threshold. Short
-    comments (< 5 words, e.g. a genuine 'Not accetable') must match
-    exactly, so a terse reviewer verdict is never mistaken for vendor
-    content."""
+    a comment fragment scores 0.71 — safely below the threshold.
+
+    Column-interleaved vendor text (two-column installation manuals) breaks
+    shingle contiguity: pdfplumber merges columns per visual line, so the
+    LLM's cleanly de-interleaved sentence no longer appears contiguously in
+    the twin. Interleaving inserts words but never REORDERS them, so a
+    second test matches the comment as an ordered subsequence of the twin
+    text within a bounded window (4x the comment length).
+
+    Short comments (2-4 words, e.g. a false 'VERY COARSE') must match
+    exactly; single-word comments (a genuine 'Model' list item) are never
+    vendor-classified."""
     if not vendor_blob:
         return False
     words = re.sub(r'[^a-z0-9]+', ' ', comment.lower()).split()
-    if not words:
+    if len(words) < 2:
         return False
     if len(words) < 5:
         return f" {' '.join(words)} " in vendor_blob
     shingles = [' '.join(words[i:i + 5]) for i in range(len(words) - 4)]
     hits = sum(1 for s in shingles if s in vendor_blob)
-    return hits / len(shingles) >= 0.8
+    if hits / len(shingles) >= 0.8:
+        return True
+    base = vendor_blob.split()
+    max_span = 4 * len(words)
+    for start in (i for i, w in enumerate(base) if w == words[0]):
+        i, j = start, 0
+        while i < len(base) and j < len(words) and i - start < max_span:
+            if base[i] == words[j]:
+                j += 1
+            i += 1
+        if j == len(words):
+            return True
+    return False
 
 
 def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None):
