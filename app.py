@@ -59,6 +59,10 @@ REQUEST_TIMEOUT   = 90      # seconds per HTTP request
 CHARS_PER_TOKEN   = 4.0     # rough token estimate (≈4 chars/token English)
 MAX_CHUNKS_PER_DOC = 12     # emergency cap on requests per document; only a
                             # pathological doc ever hits this (12 x 24k chars)
+MAX_OUTPUT_TOKENS  = 4096   # default completion budget; a provider entry can
+                            # override with "max_tokens" (reasoning models such
+                            # as Gemini 2.5 spend hidden thinking tokens out of
+                            # this same budget, so they need far more headroom)
 
 # ----------------------------------------------------------------------------
 # SUPPORTED APIS — add a new LLM service by adding an entry here.
@@ -89,6 +93,11 @@ SUPPORTED_APIS = {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         "format": "openai",
         "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
+        # Gemini 2.5 models think before answering and the OpenAI-compat
+        # endpoint counts those hidden tokens against max_tokens; 4096 leaves
+        # almost nothing for the answer and long comment lists get cut off
+        # mid-JSON (observed: response died ~175 visible tokens in).
+        "max_tokens": 32768,
     },
     "kimi": {
         "url": "https://api.moonshot.ai/v1/chat/completions",
@@ -1168,10 +1177,11 @@ def _headers_and_payload(cfg, api_key, model, prompt):
     for k, v in cfg.get("extra_headers", {}).items():
         headers[k] = v
 
+    max_tokens = cfg.get("max_tokens", MAX_OUTPUT_TOKENS)
     if fmt == "anthropic":
         payload = {
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
     else:
@@ -1179,7 +1189,7 @@ def _headers_and_payload(cfg, api_key, model, prompt):
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
         }
     return headers, payload
 
@@ -1352,9 +1362,14 @@ def _parse_comments(content):
         parsed = None
 
     if parsed is None:
-        # Salvage a comments array even if the outer JSON is malformed.
+        # Salvage a comments array even if the outer JSON is malformed. A
+        # response cut off at the output-token limit never closes the array,
+        # so fall back to everything after '"comments": [' and keep only the
+        # COMPLETE quoted strings (the trailing half-written item is dropped).
+        # Partial recovery beats discarding an entire submittal.
         try:
-            m = re.search(r'"comments"\s*:\s*\[(.*?)\]', content, re.S)
+            m = re.search(r'"comments"\s*:\s*\[(.*?)\]', content, re.S) \
+                or re.search(r'"comments"\s*:\s*\[(.*)', content, re.S)
             if m:
                 items = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
                 def _unescape(s):
