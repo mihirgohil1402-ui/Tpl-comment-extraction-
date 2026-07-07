@@ -1152,6 +1152,12 @@ Below is the text of a submittal PDF. Reviewers have added comments/markups requ
 Extract EVERY distinct reviewer comment as its own separate item, in the order they appear in the text.
 
 STRICT RULES:
+- THE MOST IMPORTANT RULE: only text ADDED BY THE REVIEWER during review is a comment. Text PRINTED in the submitted document (datasheets, specifications, manuals, drawings, catalogues) is NEVER a comment, even when it sounds like a requirement or instruction.
+- Sentences describing what equipment shall/must do or how it is constructed are specification text printed in the document - exclude them. A reviewer-added remark instead points at a gap, error or missing detail in THIS submittal, or demands confirmation, correction or resubmission from the vendor.
+- Do NOT include: installation/storage/operation instructions from manuals; drawing notes (often ALL CAPS); catalogue/brochure text about the product or accessories; table rows, spare part lists and quantities; section titles; the vendor's own replies (e.g. noted / considered / not applicable).
+- If you cannot tell whether the reviewer added a sentence or it was printed in the document, EXCLUDE it.
+- Every item you output must be text quoted VERBATIM from the submittal below. Never rephrase, summarise, complete or invent items, and NEVER copy wording from these rules into your output.
+- Datasheet fields that are empty or unfilled are NOT comments. Never turn a blank field or table row into a request for details.
 - Each comment = ONE distinct instruction, requirement, or question.
 - If several requirements are written together (numbered 1) 2) 3) OR just run together in a block), SPLIT them into separate items. Never combine two different requirements into one item.
 - Do NOT include section headers or lead-ins such as "Clarifications required for the following points", "Following items to be mentioned", "Please incorporate following detail". Skip those; only output the actual items under them.
