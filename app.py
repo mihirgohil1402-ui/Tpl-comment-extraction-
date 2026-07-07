@@ -146,6 +146,27 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 PROVIDER_PRIORITY = ["gemini", "groq", "kimi"]
 
 
+def _seconds_to_daily_reset(now):
+    """Seconds until the next free-tier daily reset (midnight US-Pacific for
+    Google) plus a small buffer. Falls back to 6h if tz data is missing."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+        pt = ZoneInfo("America/Los_Angeles")
+        dt = datetime.fromtimestamp(now, pt)
+        nxt = (dt + timedelta(days=1)).replace(hour=0, minute=2, second=0,
+                                               microsecond=0)
+        return max(60.0, (nxt - dt).total_seconds())
+    except Exception:
+        return 6 * 3600.0
+
+
+# When every key is cooling down, waits up to this long are slept through
+# (short rate-limit windows); anything longer means daily quotas - give up
+# fast with a clear message instead of grinding for an hour.
+QUOTA_GIVEUP_WAIT = 900.0
+
+
 class ApiKey:
     """One API key with its own independent stats and cooldown."""
     def __init__(self, provider, key, label):
@@ -168,17 +189,23 @@ class ApiKey:
     def cooldown_remaining(self, now):
         return max(0.0, self.cooldown_until - now)
 
-    def mark_429(self, now, retry_after=None):
-        """Put this key on exponential-backoff cooldown. Doesn't retry it now.
-        Honours the server's Retry-After when it is longer than our own
-        backoff, so we never knock on a door the server told us is closed."""
+    def mark_429(self, now, retry_after=None, quota_daily=False):
+        """Put this key on cooldown. Doesn't retry it now.
+        Honours the server's requested wait (header or body) when it is
+        longer than our own backoff, so we never knock on a door the server
+        told us is closed. A DAILY-quota 429 benches the key until the
+        provider's daily reset - retrying it every 30s only burns the
+        attempt budget against a window that refills once a day."""
         self.total_429 += 1
         self.total_failures += 1
         self.retry_count += 1
         self._429_streak += 1
+        if quota_daily:
+            self.cooldown_until = now + _seconds_to_daily_reset(now)
+            return
         wait = min(BACKOFF_BASE ** self._429_streak, BACKOFF_CAP)
         if retry_after:
-            wait = max(wait, min(float(retry_after), 120.0))
+            wait = max(wait, min(float(retry_after), 900.0))
         self.cooldown_until = now + wait
 
     def mark_other_failure(self, now):
@@ -1209,11 +1236,35 @@ def _extract_content(fmt, data):
     return data["choices"][0]["message"]["content"]
 
 
+_RETRY_IN_RE = re.compile(r'retry in ([\d.]+)\s*s', re.I)
+_DAILY_QUOTA_RE = re.compile(r'PerDay|RPD|per day|daily', re.I)
+
+
+def _parse_429(txt, header_retry_after):
+    """Extract (retry_seconds, is_daily) from a 429 response body.
+    Google's OpenAI-compat endpoint sends 'Please retry in 21.3s' and a
+    quotaId like 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' in the
+    body; the Retry-After header is often absent. A daily quota means the
+    key is useless until the provider's daily reset - retrying it in 30s
+    only burns the attempt budget."""
+    retry_secs = header_retry_after
+    m = _RETRY_IN_RE.search(txt or "")
+    if m:
+        try:
+            body_secs = float(m.group(1))
+            retry_secs = max(retry_secs or 0, body_secs)
+        except ValueError:
+            pass
+    is_daily = bool(_DAILY_QUOTA_RE.search(txt or ""))
+    return retry_secs, is_daily
+
+
 async def _single_call(session, cfg, api_key, model, prompt):
-    """One HTTP attempt. Returns (content, error, status, retry_after).
-    Exactly one of content/error is non-None. status is the HTTP code (or
-    None on exception); retry_after is the server's Retry-After seconds on
-    429/5xx when provided."""
+    """One HTTP attempt. Returns (content, error, status, retry_after,
+    quota_daily). Exactly one of content/error is non-None. status is the
+    HTTP code (or None on exception); retry_after is the wait the server
+    asked for on 429/5xx (header or body); quota_daily is True when the
+    429 named a per-day quota."""
     url = cfg["url"]
     fmt = cfg.get("format", "openai")
     headers, payload = _headers_and_payload(cfg, api_key, model, prompt)
@@ -1231,15 +1282,18 @@ async def _single_call(session, cfg, api_key, model, prompt):
             if status == 200:
                 data = await resp.json()
                 try:
-                    return _extract_content(fmt, data), None, status, None
+                    return _extract_content(fmt, data), None, status, None, False
                 except (KeyError, IndexError, TypeError) as e:
-                    return None, f"bad response shape: {str(e)[:60]}", status, None
+                    return None, f"bad response shape: {str(e)[:60]}", status, None, False
             txt = await resp.text()
-            return None, f"HTTP {status}: {txt[:160]}", status, retry_after
+            quota_daily = False
+            if status == 429:
+                retry_after, quota_daily = _parse_429(txt, retry_after)
+            return None, f"HTTP {status}: {txt[:160]}", status, retry_after, quota_daily
     except asyncio.TimeoutError:
-        return None, "timeout", None, None
+        return None, "timeout", None, None, False
     except Exception as e:
-        return None, str(e)[:100], None, None
+        return None, str(e)[:100], None, None, False
 
 
 async def call_with_key_pool(session, prompt, model, primary_provider,
@@ -1285,7 +1339,19 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
 
         # Every key is cooling down -> wait for the soonest (requirement 6/7).
         if wait > 0:
-            await asyncio.sleep(min(wait, BACKOFF_CAP))
+            if wait > QUOTA_GIVEUP_WAIT:
+                # Soonest key is hours away = daily quotas exhausted on
+                # every key. Grinding retries cannot help; fail fast with
+                # an actionable message (partial results are still kept).
+                hrs = wait / 3600.0
+                return None, (f"daily quota exhausted on all API keys - "
+                              f"earliest reset in ~{hrs:.1f}h. Add a key "
+                              f"from an unused project or rerun after the "
+                              f"daily reset.")
+            # Short rate-limit window: sleep it out fully so the next
+            # attempt fires into an OPEN window instead of burning an
+            # attempt against a closed one.
+            await asyncio.sleep(wait + 0.05)
             now = time.time()
 
         cfg = SUPPORTED_APIS.get(api_key.provider)
@@ -1301,7 +1367,7 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
         api_key.last_request_time = now
 
         t0 = time.time()
-        content, err, status, retry_after = await _single_call(
+        content, err, status, retry_after, quota_daily = await _single_call(
             session, cfg, api_key.key, use_model, prompt)
         latency = time.time() - t0
 
@@ -1327,8 +1393,9 @@ async def call_with_key_pool(session, prompt, model, primary_provider,
         # Failure handling — per key.
         now = time.time()
         if status == 429:
-            api_key.mark_429(now, retry_after)  # cooldown THIS key only,
-            tried_notes.append(f"{api_key.label}:429")
+            api_key.mark_429(now, retry_after, quota_daily)
+            tried_notes.append(
+                f"{api_key.label}:429{'-day' if quota_daily else ''}")
             continue                            # immediately try next key
         elif status in RETRYABLE_STATUS or status is None:
             api_key.mark_other_failure(now)     # 5xx / timeout
@@ -1431,30 +1498,44 @@ async def _llm_only(session, file_name, pdf_text, doc_name, unreadable,
     if trace is not None:
         trace.chunks = len(chunks)
 
+    # This document WAS selected as comment-bearing, so an empty result is
+    # suspicious - one silent empty answer (e.g. an over-cautious fallback
+    # model) should not end the submittal. One full retry pass, then accept.
     all_comments = []
     last_err = None
-    for ci, chunk in enumerate(chunks, 1):
-        prompt = PROMPT_TEMPLATE.format(body=chunk)
-        if trace is not None:
-            trace.prompts.append(prompt)
-        content, err = await call_with_key_pool(
-            session, prompt, model, api_choice, key_pool, analytics, sub_id
-        )
-        if trace is not None:
-            trace.responses.append({"chunk": ci, "content": content,
-                                    "error": err, "parse_error": None})
-        if err or content is None:
-            last_err = err or "no content"
-            print(f"DEBUG {sub_id}: {last_err}")
-            continue
-        parsed, _raw = _parse_comments(content)
-        if parsed is None:
-            last_err = f"No JSON in response (got: {(_raw or '')[:40]})"
+    for _pass in (1, 2):
+        for ci, chunk in enumerate(chunks, 1):
+            prompt = PROMPT_TEMPLATE.format(body=chunk)
             if trace is not None:
-                trace.responses[-1]["parse_error"] = last_err
-            print(f"DEBUG {sub_id}: {last_err}")
-            continue
-        all_comments.extend(_clean_comment_list(parsed))
+                trace.prompts.append(prompt)
+            content, err = await call_with_key_pool(
+                session, prompt, model, api_choice, key_pool, analytics, sub_id
+            )
+            if trace is not None:
+                trace.responses.append({"chunk": ci, "content": content,
+                                        "error": err, "parse_error": None})
+            if err or content is None:
+                last_err = err or "no content"
+                print(f"DEBUG {sub_id}: {last_err}")
+                continue
+            parsed, _raw = _parse_comments(content)
+            if parsed is None:
+                last_err = f"No JSON in response (got: {(_raw or '')[:40]})"
+                if trace is not None:
+                    trace.responses[-1]["parse_error"] = last_err
+                print(f"DEBUG {sub_id}: {last_err}")
+                continue
+            all_comments.extend(_clean_comment_list(parsed))
+        if all_comments:
+            break
+        # Don't burn a retry pass when the pool itself is out of quota.
+        if last_err and ("daily quota exhausted" in last_err
+                         or "no API keys" in last_err
+                         or "authentication failed" in last_err):
+            break
+        if _pass == 1 and trace is not None:
+            trace.notes.append("first pass yielded no comments - retrying "
+                               "all chunks once")
 
     # De-duplicate across chunks/pages while preserving order.
     all_comments = dedupe_comments(all_comments)
