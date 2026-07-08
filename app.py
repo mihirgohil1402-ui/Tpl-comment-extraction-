@@ -690,7 +690,8 @@ def _has_reviewer_annotations(raw):
     return False
 
 
-def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None):
+def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None,
+                     page_meta=None):
     """Pull text from the COMMENT-bearing PDFs using pdfplumber.
 
     Reviewer comments live only in an annotated markup PDF or a reviewer
@@ -801,6 +802,8 @@ def extract_pdf_text(pdf_items, treat_all_as_comments=False, trace=None):
                     if t.strip() or annot_texts:
                         pages_text.append(t)
                         pages_annots.append(annot_texts)
+                        if page_meta is not None:
+                            page_meta.append((name, page_no))
                     if len(t.strip()) < 50 and has_images:
                         unreadable_pages += 1
         except Exception as e:
@@ -1153,6 +1156,31 @@ LEADIN = re.compile(
 
 def strip_leadin(text):
     return LEADIN.sub('', text).strip()
+
+
+def _locate_norm(s):
+    return re.sub(r'\W+', ' ', s).strip().lower()
+
+
+def locate_comment_page(comment, pages, page_annots, page_meta):
+    """Best-effort page attribution for a CLEANED comment: find the page whose
+    annotations (checked first — most comments are markups) or text layer
+    contain it. Tries the full normalised comment, then shrinking prefixes,
+    because cleaning may have split or trimmed what the LLM returned.
+    Returns the page number within its source PDF, or None."""
+    c = _locate_norm(comment)
+    for key in (c, c[:80], c[:40]):
+        if len(key) < 12:
+            continue
+        for i, annots in enumerate(page_annots):
+            for a in annots:
+                an = _locate_norm(a)
+                if an and (key in an or (len(an) >= 12 and an in c)):
+                    return page_meta[i][1] if i < len(page_meta) else None
+        for i, ptxt in enumerate(pages):
+            if key in _locate_norm(ptxt):
+                return page_meta[i][1] if i < len(page_meta) else None
+    return None
 
 
 def dedupe_comments(comments):
@@ -1563,9 +1591,10 @@ async def _process_one(session, file_name, file_bytes, sem,
             is_single_pdf = file_name.lower().endswith('.pdf')
             pdf_items = _pdf_items_from_upload(file_name, file_bytes)
             file_bytes = None
+            page_meta = []
             pages, page_annots, unreadable, had_comment_file = \
                 extract_pdf_text(pdf_items, treat_all_as_comments=is_single_pdf,
-                                 trace=trace)
+                                 trace=trace, page_meta=page_meta)
             doc_name = extract_doc_name_from_items(pdf_items)
             pdf_items = None
             if not had_comment_file:
@@ -1574,6 +1603,11 @@ async def _process_one(session, file_name, file_bytes, sem,
                        "document": doc_name, "unreadable": 0,
                        "comments": [], "error": None}
             else:
+                # Keep the ORIGINAL page texts for page attribution — the
+                # boilerplate-deduped copies below lose lines a comment may
+                # need to be located by.
+                orig_pages = list(pages)
+                orig_annots = [list(a) for a in page_annots]
                 # Token reduction: strip repeated boilerplate, then re-attach
                 # each page's annotation text (page order preserved;
                 # annotations are never subject to boilerplate removal).
@@ -1592,6 +1626,16 @@ async def _process_one(session, file_name, file_bytes, sem,
                 res = await _llm_only(session, file_name, text, doc_name,
                                       unreadable, api_choice, model,
                                       key_pool, analytics, trace=trace)
+                # Tag each comment with the page it was found on, e.g.
+                # "... (page 6)". Attribution is best-effort: a comment the
+                # locator can't place verbatim is left untagged.
+                if res.get("comments"):
+                    tagged = []
+                    for c in res["comments"]:
+                        pg = locate_comment_page(c, orig_pages, orig_annots,
+                                                 page_meta)
+                        tagged.append(f"{c} (page {pg})" if pg else c)
+                    res["comments"] = tagged
         except Exception as e:
             if trace is not None:
                 trace.notes.append(f"processing exception: {str(e)[:80]}")
